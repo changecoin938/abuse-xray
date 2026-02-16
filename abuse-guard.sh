@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.4.0"
+ABUSE_GUARD_VERSION="0.5.0"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -40,13 +40,14 @@ Usage:
 Options (install):
   --backend auto|nft|iptables     (default: auto)
   --lockdown                      Default-deny inbound (opens only SSH + given ports)
-  --ssh-port <port>               (default: auto-detect or 22)
+  --ssh-port <list>               One or more SSH ports (default: auto-detect or 22)
   --xray-ports <list>             Comma/space list (e.g. 443,8443)
   --panel-ports <list>            Comma/space list (e.g. 54321)
   --allow-in-tcp <list>           Extra inbound TCP ports (e.g. 80,51821)
   --allow-in-udp <list>           Extra inbound UDP ports (e.g. 51820)
   --no-auto-detect                Disable automatic port scanning
   --allow-ss-fallback             Allow generic listener scan fallback (unsafe in lockdown)
+  --force                         Ignore UFW/firewalld conflict checks
   --no-sysctl                     Don't write /etc/sysctl.d/99-abuse-guard.conf
 
 What it does:
@@ -68,17 +69,18 @@ EOF
 }
 
 detect_ssh_port() {
-  local port=""
+  local ports=""
   if have_cmd sshd; then
-    port="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}' || true)"
+    ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | tr '\n' ' ' || true)"
   fi
-  if [[ -z "${port}" && -r /etc/ssh/sshd_config ]]; then
-    port="$(awk 'tolower($1)=="port"{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+  if [[ -z "${ports}" && -r /etc/ssh/sshd_config ]]; then
+    ports="$(awk 'tolower($1)=="port"{print $2}' /etc/ssh/sshd_config 2>/dev/null | tr '\n' ' ' || true)"
   fi
-  if [[ -z "${port}" ]]; then
-    port="22"
+  ports="$(dedup_ports "$(normalize_port_list "${ports}")")"
+  if [[ -z "${ports}" ]]; then
+    ports="22"
   fi
-  echo "${port}"
+  echo "${ports}"
 }
 
 normalize_port_list() {
@@ -112,6 +114,7 @@ validate_ports_or_die() {
 
 AUTO_TCP_PORTS=""
 AUTO_UDP_PORTS=""
+AUTO_PANEL_PORTS=""
 AUTO_DETECT_SOURCES=""
 
 add_detect_source() {
@@ -131,18 +134,67 @@ append_ports_var() {
   local target="$1"
   shift
   local input="${*:-}"
-  local p
+  local p start end
   for p in ${input}; do
     if [[ "${p}" =~ ^[0-9]{1,5}$ ]] && ((p >= 1 && p <= 65535)); then
       printf -v "${target}" '%s%s ' "${!target-}" "${p}"
+    elif [[ "${p}" =~ ^([0-9]{1,5})[-:]([0-9]{1,5})$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if ((start >= 1 && start <= 65535 && end >= 1 && end <= 65535 && start <= end)); then
+        printf -v "${target}" '%s%s-%s ' "${!target-}" "${start}" "${end}"
+      fi
     fi
   done
+}
+
+extract_yaml_ports_under_key() {
+  local cfg="$1"
+  local key="${2:-ports}"
+  awk -v key="${key}" '
+    function indent_of(line,    i, ch) {
+      for (i = 1; i <= length(line); i++) {
+        ch = substr(line, i, 1)
+        if (ch != " " && ch != "\t") {
+          return i - 1
+        }
+      }
+      return length(line)
+    }
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      if (match(line, "^[[:space:]]*" key ":[[:space:]]*$")) {
+        in_key = 1
+        key_indent = indent_of(line)
+        next
+      }
+      if (!in_key) {
+        next
+      }
+      if (line ~ /^[[:space:]]*$/) {
+        next
+      }
+      current_indent = indent_of(line)
+      if (current_indent <= key_indent) {
+        in_key = 0
+        next
+      }
+      if (match(line, /^[[:space:]]*-[[:space:]]*[0-9]{1,5}([:-][0-9]{1,5})?([[:space:]]*#.*)?$/)) {
+        gsub(/^[[:space:]]*-[[:space:]]*/, "", line)
+        gsub(/[[:space:]]*#.*/, "", line)
+        gsub(/[[:space:]]+$/, "", line)
+        print line
+      }
+    }
+  ' "${cfg}"
 }
 
 auto_detect_ports() {
   local allow_ss_fallback="${1:-0}"
   AUTO_TCP_PORTS=""
   AUTO_UDP_PORTS=""
+  AUTO_PANEL_PORTS=""
   AUTO_DETECT_SOURCES=""
 
   local cfg db ports ports2 ports3 svc xui_dir
@@ -150,8 +202,8 @@ auto_detect_ports() {
 
   # X-UI / 3x-ui panel ports from running process (most reliable)
   if have_cmd ss; then
-    ports="$(ss -tlnpH 2>/dev/null | grep -Ei 'x-ui|3x-ui|xui|xray' | awk '{ if (match($4, /:[0-9]+$/)) { print substr($4, RSTART+1, RLENGTH-1) } }' | sort -un || true)"
-    append_ports_var AUTO_TCP_PORTS "${ports}"
+    ports="$(ss -tlnpH 2>/dev/null | grep -Ei 'x-ui|3x-ui|xui' | awk '{ if (match($4, /:[0-9]+$/)) { print substr($4, RSTART+1, RLENGTH-1) } }' | sort -un || true)"
+    append_ports_var AUTO_PANEL_PORTS "${ports}"
     [[ -n "${ports}" ]] && add_detect_source "xui-ss"
   fi
 
@@ -159,8 +211,9 @@ auto_detect_ports() {
   for cfg in /usr/local/etc/xray/*.json /etc/xray/*.json; do
     [[ -f "${cfg}" ]] || continue
     found_config_files="1"
-    ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+    ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*"?[0-9]{1,5}([:-][0-9]{1,5})?"?' "${cfg}" 2>/dev/null | grep -oE '[0-9]{1,5}([:-][0-9]{1,5})?' || true)"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
     [[ -n "${ports}" ]] && add_detect_source "xray-json"
   done
 
@@ -168,8 +221,8 @@ auto_detect_ports() {
   for cfg in /usr/local/x-ui/config.json /etc/x-ui/config.json /opt/x-ui/config.json /root/x-ui/config.json; do
     [[ -f "${cfg}" ]] || continue
     found_config_files="1"
-    ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*\"?[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
-    append_ports_var AUTO_TCP_PORTS "${ports}"
+    ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*"?[0-9]{1,5}([:-][0-9]{1,5})?"?' "${cfg}" 2>/dev/null | grep -oE '[0-9]{1,5}([:-][0-9]{1,5})?' || true)"
+    append_ports_var AUTO_PANEL_PORTS "${ports}"
     [[ -n "${ports}" ]] && add_detect_source "xui-json"
   done
 
@@ -181,27 +234,31 @@ auto_detect_ports() {
       found_config_files="1"
       for cfg in "${xui_dir}"/config.json "${xui_dir}"/config*.json; do
         [[ -f "${cfg}" ]] || continue
-        ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*\"?[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
-        append_ports_var AUTO_TCP_PORTS "${ports}"
+        ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*"?[0-9]{1,5}([:-][0-9]{1,5})?"?' "${cfg}" 2>/dev/null | grep -oE '[0-9]{1,5}([:-][0-9]{1,5})?' || true)"
+        append_ports_var AUTO_PANEL_PORTS "${ports}"
         [[ -n "${ports}" ]] && add_detect_source "xui-systemd-json"
       done
       if have_cmd sqlite3; then
         for db in "${xui_dir}"/*.db "${xui_dir}"/db/*.db; do
           [[ -f "${db}" ]] || continue
-          local sqlite_hit="0"
+          local panel_hit="0"
+          local inbounds_hit="0"
           ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
           if [[ -z "${ports}" ]]; then
             ports="$(sqlite3 "${db}" "SELECT value FROM setting WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
           fi
-          [[ -n "${ports}" ]] && sqlite_hit="1"
-          append_ports_var AUTO_TCP_PORTS "${ports}"
+          [[ -n "${ports}" ]] && panel_hit="1"
+          append_ports_var AUTO_PANEL_PORTS "${ports}"
           ports2="$(sqlite3 "${db}" "SELECT port FROM inbounds WHERE enable=1" 2>/dev/null || true)"
-          [[ -n "${ports2}" ]] && sqlite_hit="1"
+          [[ -n "${ports2}" ]] && inbounds_hit="1"
           append_ports_var AUTO_TCP_PORTS "${ports2}"
+          append_ports_var AUTO_UDP_PORTS "${ports2}"
           ports3="$(sqlite3 "${db}" "SELECT port FROM inbound WHERE enable=1" 2>/dev/null || true)"
-          [[ -n "${ports3}" ]] && sqlite_hit="1"
+          [[ -n "${ports3}" ]] && inbounds_hit="1"
           append_ports_var AUTO_TCP_PORTS "${ports3}"
-          [[ "${sqlite_hit}" == "1" ]] && add_detect_source "xui-systemd-sqlite"
+          append_ports_var AUTO_UDP_PORTS "${ports3}"
+          [[ "${panel_hit}" == "1" ]] && add_detect_source "xui-systemd-sqlite-panel"
+          [[ "${inbounds_hit}" == "1" ]] && add_detect_source "xui-systemd-sqlite-inbounds"
         done
       fi
     done
@@ -222,21 +279,25 @@ auto_detect_ports() {
       /root/x-ui/*.db; do
       [[ -f "${db}" ]] || continue
       found_config_files="1"
-      local sqlite_hit="0"
+      local panel_hit="0"
+      local inbounds_hit="0"
       ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
       if [[ -z "${ports}" ]]; then
         ports="$(sqlite3 "${db}" "SELECT value FROM setting WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
       fi
-      [[ -n "${ports}" ]] && sqlite_hit="1"
-      append_ports_var AUTO_TCP_PORTS "${ports}"
+      [[ -n "${ports}" ]] && panel_hit="1"
+      append_ports_var AUTO_PANEL_PORTS "${ports}"
 
       ports2="$(sqlite3 "${db}" "SELECT port FROM inbounds WHERE enable=1" 2>/dev/null || true)"
-      [[ -n "${ports2}" ]] && sqlite_hit="1"
+      [[ -n "${ports2}" ]] && inbounds_hit="1"
       append_ports_var AUTO_TCP_PORTS "${ports2}"
+      append_ports_var AUTO_UDP_PORTS "${ports2}"
       ports3="$(sqlite3 "${db}" "SELECT port FROM inbound WHERE enable=1" 2>/dev/null || true)"
-      [[ -n "${ports3}" ]] && sqlite_hit="1"
+      [[ -n "${ports3}" ]] && inbounds_hit="1"
       append_ports_var AUTO_TCP_PORTS "${ports3}"
-      [[ "${sqlite_hit}" == "1" ]] && add_detect_source "xui-sqlite"
+      append_ports_var AUTO_UDP_PORTS "${ports3}"
+      [[ "${panel_hit}" == "1" ]] && add_detect_source "xui-sqlite-panel"
+      [[ "${inbounds_hit}" == "1" ]] && add_detect_source "xui-sqlite-inbounds"
     done
   fi
 
@@ -244,28 +305,48 @@ auto_detect_ports() {
   for cfg in /etc/paqet/*.yaml /etc/paqet/*.yml /opt/paqet/*.yaml /opt/paqet/*.yml; do
     [[ -f "${cfg}" ]] || continue
     found_config_files="1"
-    ports="$(grep -oE '^[[:space:]]*port:[[:space:]]*[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+    local paqet_hit="0"
+    ports="$(grep -oE '^[[:space:]]*port:[[:space:]]*[0-9]{1,5}([:-][0-9]{1,5})?' "${cfg}" 2>/dev/null | grep -oE '[0-9]{1,5}([:-][0-9]{1,5})?' || true)"
+    [[ -n "${ports}" ]] && paqet_hit="1"
     append_ports_var AUTO_TCP_PORTS "${ports}"
-    ports="$(grep -oE '^[[:space:]]*-[[:space:]]*[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
+    ports="$(extract_yaml_ports_under_key "${cfg}" "ports" 2>/dev/null || true)"
+    [[ -n "${ports}" ]] && paqet_hit="1"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
+    [[ "${paqet_hit}" == "1" ]] && add_detect_source "paqet-yaml"
   done
 
   # GFK ports
   for cfg in /etc/gfk/*.yaml /etc/gfk/*.yml /opt/gfk/*.yaml /opt/gfk/*.yml; do
     [[ -f "${cfg}" ]] || continue
     found_config_files="1"
-    ports="$(grep -oE '^[[:space:]]*port:[[:space:]]*[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+    local gfk_hit="0"
+    ports="$(grep -oE '^[[:space:]]*port:[[:space:]]*[0-9]{1,5}([:-][0-9]{1,5})?' "${cfg}" 2>/dev/null | grep -oE '[0-9]{1,5}([:-][0-9]{1,5})?' || true)"
+    [[ -n "${ports}" ]] && gfk_hit="1"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
+    ports="$(extract_yaml_ports_under_key "${cfg}" "ports" 2>/dev/null || true)"
+    [[ -n "${ports}" ]] && gfk_hit="1"
+    append_ports_var AUTO_TCP_PORTS "${ports}"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
+    [[ "${gfk_hit}" == "1" ]] && add_detect_source "gfk-yaml"
   done
 
   # Dangel-Tunnel ports
   for cfg in /etc/dangel-tunnel/*.yaml /etc/dangel-tunnel/*.yml; do
     [[ -f "${cfg}" ]] || continue
     found_config_files="1"
+    local dangel_hit="0"
     ports="$(grep -oE '^[[:space:]]*listen:[[:space:]]*"?[^"]*:[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+$' || true)"
+    [[ -n "${ports}" ]] && dangel_hit="1"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
     ports="$(grep -oE '^[[:space:]]*map:[[:space:]]*"?[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+    [[ -n "${ports}" ]] && dangel_hit="1"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
+    [[ "${dangel_hit}" == "1" ]] && add_detect_source "dangel-yaml"
   done
 
   # WireGuard listen ports
@@ -280,7 +361,7 @@ auto_detect_ports() {
     ports="$(ss -tlnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         line=tolower($0)
-        if (line ~ /(xray|x-ui|3x-ui|paqet|gfk|dangel)/) {
+        if (line ~ /(xray|paqet|gfk|dangel)/) {
           if (match($4, /:[0-9]+$/)) {
             print substr($4, RSTART+1, RLENGTH-1)
           }
@@ -291,7 +372,7 @@ auto_detect_ports() {
     ports="$(ss -ulnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         line=tolower($0)
-        if (line ~ /(xray|x-ui|3x-ui|paqet|gfk|dangel)/) {
+        if (line ~ /(xray|paqet|gfk|dangel)/) {
           if (match($4, /:[0-9]+$/)) {
             print substr($4, RSTART+1, RLENGTH-1)
           }
@@ -302,7 +383,7 @@ auto_detect_ports() {
   fi
 
   # Fallback: active listeners if no known config files and no detected ports
-  if [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" ]] && have_cmd ss && [[ "${allow_ss_fallback}" == "1" ]]; then
+  if [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" && -z "${AUTO_PANEL_PORTS}" ]] && have_cmd ss && [[ "${allow_ss_fallback}" == "1" ]]; then
     ports="$(ss -tlnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         if (match($4, /:[0-9]+$/)) {
@@ -319,12 +400,13 @@ auto_detect_ports() {
       }' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
     [[ -n "${ports}" ]] && add_detect_source "ss-fallback"
-  elif [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" ]] && have_cmd ss; then
+  elif [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" && -z "${AUTO_PANEL_PORTS}" ]] && have_cmd ss; then
     log "WARNING: no config/db ports detected and ss-fallback is disabled; use manual ports or --allow-ss-fallback."
   fi
 
   AUTO_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_TCP_PORTS}")")"
   AUTO_UDP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_UDP_PORTS}")")"
+  AUTO_PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_PANEL_PORTS}")")"
 }
 
 ports_for_nft() {
@@ -397,7 +479,7 @@ APPLY_SYSCTL="${apply_sysctl}"
 AUTO_DETECT="${auto_detect}"
 ALLOW_SS_FALLBACK="${allow_ss_fallback}"
 EOF
-  chmod 600 "${config_file}"
+  chmod 0644 "${config_file}"
   umask "${old_umask}"
 }
 
@@ -476,18 +558,34 @@ read_config_or_die() {
   read_config "1"
 }
 
+detect_running_script_source() {
+  local candidate
+  for candidate in "${BASH_SOURCE[0]:-}" "$0" /proc/$$/fd/255 /proc/self/fd/255 /dev/fd/255; do
+    [[ -n "${candidate}" ]] || continue
+    [[ -r "${candidate}" ]] || continue
+    echo "${candidate}"
+    return 0
+  done
+  return 1
+}
+
 install_self() {
+  local src=""
   mkdir -p "$(dirname "${installed_bin}")"
-  # Copy script to stable path for systemd
+  # Copy current running script to stable path for systemd.
+  # Prefer local source over network download to avoid version drift.
   if [[ "${0}" != "${installed_bin}" ]]; then
-    if [[ -f "$0" ]]; then
-      cp -f "$0" "${installed_bin}"
-    elif have_cmd curl; then
+    if src="$(detect_running_script_source)"; then
+      if ! cat "${src}" > "${installed_bin}"; then
+        src=""
+      fi
+    fi
+    if [[ -z "${src}" ]] && have_cmd curl; then
       curl -fsSL "${script_raw_url}" -o "${installed_bin}"
-    elif have_cmd wget; then
+    elif [[ -z "${src}" ]] && have_cmd wget; then
       wget -qO "${installed_bin}" "${script_raw_url}"
-    else
-      die "Could not install self from pipe: curl/wget not found"
+    elif [[ -z "${src}" ]]; then
+      die "Could not install self from pipe: no readable source and curl/wget not found"
     fi
     chmod 0755 "${installed_bin}"
   fi
@@ -509,6 +607,9 @@ net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.tcp_rfc1337 = 1
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 EOF
@@ -574,11 +675,13 @@ table inet abuse_guard {
     policy $( [[ "${lockdown}" == "1" ]] && echo "drop" || echo "accept" );
 
     ct state invalid drop
-    ct state established,related accept
+    ct state established,related,untracked accept
     iif "lo" accept
 
-    ip protocol icmp accept
-    ip6 nexthdr ipv6-icmp accept
+    ip protocol icmp limit rate 10/second burst 20 packets accept
+    ip protocol icmp drop
+    ip6 nexthdr ipv6-icmp limit rate 10/second burst 20 packets accept
+    ip6 nexthdr ipv6-icmp drop
 
     # Inbound SYN flood / connection abuse control
     tcp flags syn limit rate over 20/second burst 40 packets drop
@@ -711,10 +814,11 @@ iptables_apply_family() {
 
   # INPUT hygiene
   "${ipt}" -A "${iptables_chain_name_in}" -m conntrack --ctstate INVALID -j DROP
-  "${ipt}" -A "${iptables_chain_name_in}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "${ipt}" -A "${iptables_chain_name_in}" -m conntrack --ctstate ESTABLISHED,RELATED,UNTRACKED -j ACCEPT
   "${ipt}" -A "${iptables_chain_name_in}" -i lo -j ACCEPT
 
-  "${ipt}" -A "${iptables_chain_name_in}" -p "${icmp_proto}" -j ACCEPT
+  "${ipt}" -A "${iptables_chain_name_in}" -p "${icmp_proto}" -m limit --limit 10/sec --limit-burst 20 -j ACCEPT
+  "${ipt}" -A "${iptables_chain_name_in}" -p "${icmp_proto}" -j DROP
 
   # Inbound SYN rate limiting + per-IP concurrent connection cap
   if [[ "${has_hashlimit}" == "1" ]]; then
@@ -790,7 +894,11 @@ iptables_apply_family() {
   "${ipt}" -A "${iptables_chain_name_out}" -p udp --dport 51413 \
     -m limit --limit 5/min -j LOG --log-prefix "[abuse-guard-bt-udp] "
   "${ipt}" -A "${iptables_chain_name_out}" -p udp --dport 51413 -j DROP
+  "${ipt}" -A "${iptables_chain_name_out}" -p tcp --dport 6881:6999 \
+    -m limit --limit 5/min -j LOG --log-prefix "[abuse-guard-bt-tcp-range] "
   "${ipt}" -A "${iptables_chain_name_out}" -p tcp --dport 6881:6999 -j DROP
+  "${ipt}" -A "${iptables_chain_name_out}" -p udp --dport 6881:6999 \
+    -m limit --limit 5/min -j LOG --log-prefix "[abuse-guard-bt-udp-range] "
   "${ipt}" -A "${iptables_chain_name_out}" -p udp --dport 6881:6999 -j DROP
 
   if [[ "${has_string}" == "1" ]]; then
@@ -817,8 +925,8 @@ iptables_apply() {
 iptables_uninstall() {
   for ipt in iptables ip6tables; do
     have_cmd "${ipt}" || continue
-    "${ipt}" -D INPUT -j "${iptables_chain_name_in}" 2>/dev/null || true
-    "${ipt}" -D OUTPUT -j "${iptables_chain_name_out}" 2>/dev/null || true
+    while "${ipt}" -D INPUT -j "${iptables_chain_name_in}" 2>/dev/null; do :; done
+    while "${ipt}" -D OUTPUT -j "${iptables_chain_name_out}" 2>/dev/null; do :; done
     "${ipt}" -F "${iptables_chain_name_in}" 2>/dev/null || true
     "${ipt}" -F "${iptables_chain_name_out}" 2>/dev/null || true
     "${ipt}" -X "${iptables_chain_name_in}" 2>/dev/null || true
@@ -868,6 +976,7 @@ cmd_install() {
   local apply_sysctl="1"
   local auto_detect="1"
   local allow_ss_fallback="0"
+  local force="0"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -889,6 +998,8 @@ cmd_install() {
         auto_detect="0"; shift ;;
       --allow-ss-fallback)
         allow_ss_fallback="1"; shift ;;
+      --force)
+        force="1"; shift ;;
       --no-sysctl)
         apply_sysctl="0"; shift ;;
       -h|--help)
@@ -906,9 +1017,11 @@ cmd_install() {
     log "Auto-detecting tunnel/xray/panel ports..."
     auto_detect_ports "${allow_ss_fallback}"
     xray_ports="$(normalize_port_list "${xray_ports} ${AUTO_TCP_PORTS}")"
+    panel_ports="$(normalize_port_list "${panel_ports} ${AUTO_PANEL_PORTS}")"
     allow_in_udp="$(normalize_port_list "${allow_in_udp} ${AUTO_UDP_PORTS}")"
-    if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
+    if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_PANEL_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
       log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
+      log "Auto-detected Panel: ${AUTO_PANEL_PORTS:-none}"
       log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
       [[ -n "${AUTO_DETECT_SOURCES}" ]] && log "Auto-detect sources: ${AUTO_DETECT_SOURCES}"
     else
@@ -932,13 +1045,22 @@ cmd_install() {
   fi
   [[ "${backend}" == "nft" || "${backend}" == "iptables" ]] || die "--backend باید nft یا iptables یا auto باشه"
 
+  local firewall_conflict="0"
   if have_cmd ufw && ufw status >/dev/null 2>&1; then
     if ufw status | grep -qi "Status: active"; then
-      log "هشدار: UFW فعال است. ممکن است قوانین تداخل داشته باشند."
+      firewall_conflict="1"
+      log "WARNING: UFW is active; firewall rules may conflict."
     fi
   fi
   if have_cmd firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-    log "هشدار: firewalld فعال است. ممکن است قوانین تداخل داشته باشند."
+    firewall_conflict="1"
+    log "WARNING: firewalld is active; firewall rules may conflict."
+  fi
+  if [[ "${firewall_conflict}" == "1" && "${force}" != "1" ]]; then
+    die "Conflicting firewall service is active. Disable UFW/firewalld or rerun with --force."
+  fi
+  if [[ "${firewall_conflict}" == "1" && "${force}" == "1" ]]; then
+    log "WARNING: --force enabled; continuing despite firewall conflict."
   fi
 
   write_config "${backend}" "${lockdown}" "${ssh_port}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${allow_ss_fallback}"
@@ -968,18 +1090,21 @@ cmd_apply() {
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
     auto_detect_ports "${ALLOW_SS_FALLBACK}"
-    if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
+    if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_PANEL_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
       log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
+      log "Auto-detected Panel: ${AUTO_PANEL_PORTS:-none}"
       log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
       [[ -n "${AUTO_DETECT_SOURCES}" ]] && log "Auto-detect sources: ${AUTO_DETECT_SOURCES}"
     else
       log "Warning: no ports auto-detected. Use --xray-ports and --panel-ports manually."
     fi
     XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${XRAY_PORTS} ${AUTO_TCP_PORTS}")")"
+    PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${PANEL_PORTS} ${AUTO_PANEL_PORTS}")")"
     ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${ALLOW_IN_UDP} ${AUTO_UDP_PORTS}")")"
   else
     AUTO_TCP_PORTS=""
     AUTO_UDP_PORTS=""
+    AUTO_PANEL_PORTS=""
   fi
 
   XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${XRAY_PORTS}")")"
@@ -994,7 +1119,7 @@ cmd_apply() {
   validate_ports_or_die "${ALLOW_IN_UDP}"
 
   if [[ "${APPLY_SYSCTL}" == "1" ]]; then
-    [[ -f "${sysctl_file}" ]] || apply_sysctl_hardening
+    apply_sysctl_hardening
   fi
 
   case "${BACKEND}" in
@@ -1029,15 +1154,22 @@ cmd_uninstall() {
   rm -f "${config_file}"
   rm -f "${nft_file}"
   rm -f "${sysctl_file}"
+  rm -f "${installed_bin}"
   rmdir "${config_dir}" 2>/dev/null || true
+  if have_cmd sysctl; then
+    sysctl --system >/dev/null 2>&1 || true
+  fi
 
   log "حذف شد."
 }
 
 cmd_status() {
-  need_root
-  if [[ ! -r "${config_file}" ]]; then
+  if [[ ! -e "${config_file}" ]]; then
     echo "not installed (missing ${config_file})"
+    return 1
+  fi
+  if [[ ! -r "${config_file}" ]]; then
+    echo "config unreadable (${config_file}); run status as root or reinstall to refresh file mode."
     return 1
   fi
   read_config_or_die
@@ -1057,15 +1189,36 @@ cmd_status() {
   else
     AUTO_TCP_PORTS=""
     AUTO_UDP_PORTS=""
+    AUTO_PANEL_PORTS=""
   fi
   echo "auto_detected_tcp=${AUTO_TCP_PORTS:-none}"
+  echo "auto_detected_panel=${AUTO_PANEL_PORTS:-none}"
   echo "auto_detected_udp=${AUTO_UDP_PORTS:-none}"
+
+  if [[ "${EUID:-$(id -u)}" != "0" ]]; then
+    echo "rules=unknown (run as root for firewall state)"
+    return 0
+  fi
 
   if [[ "${BACKEND}" == "nft" ]] && have_cmd nft; then
     nft list table inet abuse_guard >/dev/null 2>&1 && echo "rules=loaded" || echo "rules=missing"
   fi
   if [[ "${BACKEND}" == "iptables" ]] && have_cmd iptables; then
-    iptables -S "${iptables_chain_name_out}" >/dev/null 2>&1 && echo "rules=loaded" || echo "rules=missing"
+    local v4_ok="0"
+    local v6_ok="1"
+    if iptables -S "${iptables_chain_name_in}" >/dev/null 2>&1 && iptables -S "${iptables_chain_name_out}" >/dev/null 2>&1; then
+      v4_ok="1"
+    fi
+    if have_cmd ip6tables; then
+      if ! ip6tables -S "${iptables_chain_name_in}" >/dev/null 2>&1 || ! ip6tables -S "${iptables_chain_name_out}" >/dev/null 2>&1; then
+        v6_ok="0"
+      fi
+    fi
+    if [[ "${v4_ok}" == "1" && "${v6_ok}" == "1" ]]; then
+      echo "rules=loaded"
+    else
+      echo "rules=missing"
+    fi
   fi
 }
 

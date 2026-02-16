@@ -26,11 +26,14 @@ sudo ./abuse-guard.sh install --lockdown
 # اگر می‌خواهید fallback اسکن عمومی ss هم مجاز باشد (در lockdown ریسک باز شدن پورت‌های اضافی دارد)
 sudo ./abuse-guard.sh install --lockdown --allow-ss-fallback
 
+# اگر UFW/firewalld فعال است و با آگاهی می‌خواهید ادامه دهید
+sudo ./abuse-guard.sh install --lockdown --force
+
 # کنترل دستی کامل (بدون auto-detect)
 sudo ./abuse-guard.sh install --lockdown --no-auto-detect --xray-ports "443,2053" --panel-ports "54321" --allow-in-udp "51820"
 
 # وضعیت
-sudo /usr/local/sbin/abuse-guard status
+/usr/local/sbin/abuse-guard status
 
 # اعمال مجدد قوانین (هر بار apply اجرا شود، پورت‌ها دوباره اسکن می‌شوند)
 sudo /usr/local/sbin/abuse-guard apply
@@ -52,5 +55,8 @@ sudo /usr/local/sbin/abuse-guard uninstall
 - rate limitهای ورودی/خروجی برای کاهش abuse
 
 نکته: در backend `nft` تشخیص DPI بیت‌تورنت وجود ندارد و فقط بلاک مبتنی بر پورت اعمال می‌شود.
+
+اگر از `iptables-persistent`/`netfilter-persistent` استفاده می‌کنید، قوانین abuse-guard را داخل snapshot ذخیره نکنید؛
+در غیر این صورت بعد از uninstall ممکن است قوانین قدیمی از فایل persistent دوباره لود شوند.
 
 یادآوری: حفاظت واقعی DDoS عمدتاً سمت دیتاسنتر/پرووایدر است؛ این ابزار «baseline hardening» است.
