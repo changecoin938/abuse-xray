@@ -5,7 +5,17 @@
 ## نصب سریع (پیشنهادی)
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh) install --lockdown
+# روش سازگارتر (بدون process substitution)
+curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh | sudo bash -s -- install --lockdown
+```
+
+اگر خودتان `root` هستید:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh | bash -s -- install --lockdown
+```
+
+اگر با خطای `/dev/fd/*` مواجه شدید، علتش این است که `sudo bash <(curl ...)` روی بعضی سرورها FDها را می‌بندد.
 ```
 
 ## دستورات
