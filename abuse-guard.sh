@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.3.0"
+ABUSE_GUARD_VERSION="0.3.1"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -128,7 +128,7 @@ auto_detect_ports() {
   AUTO_TCP_PORTS=""
   AUTO_UDP_PORTS=""
 
-  local cfg db ports
+  local cfg db ports ports2
   local found_config_files="0"
 
   # Xray JSON inbounds
@@ -144,7 +144,10 @@ auto_detect_ports() {
     for db in /etc/x-ui/x-ui.db /usr/local/x-ui/db/x-ui.db /usr/local/x-ui/*.db; do
       [[ -f "${db}" ]] || continue
       found_config_files="1"
-      ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null || true)"
+      ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key IN ('webPort','webport') LIMIT 1" 2>/dev/null || true)"
+      if [[ -z "${ports}" ]]; then
+        ports="$(sqlite3 "${db}" "SELECT value FROM setting WHERE key IN ('webPort','webport') LIMIT 1" 2>/dev/null || true)"
+      fi
       append_ports_var AUTO_TCP_PORTS "${ports}"
     done
   fi
@@ -183,11 +186,45 @@ auto_detect_ports() {
     append_ports_var AUTO_UDP_PORTS "${ports}"
   fi
 
+  # Active listeners (best-effort): detect ports for relevant processes even if configs/db parsing is incomplete.
+  if have_cmd ss; then
+    ports="$(ss -tlnpH 2>/dev/null | awk '
+      $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
+        line=tolower($0)
+        if (line ~ /(xray|x-ui|3x-ui|paqet|gfk|dangel)/) {
+          if (match($4, /:[0-9]+$/)) {
+            print substr($4, RSTART+1, RLENGTH-1)
+          }
+        }
+      }' || true)"
+    append_ports_var AUTO_TCP_PORTS "${ports}"
+    ports="$(ss -ulnpH 2>/dev/null | awk '
+      $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
+        line=tolower($0)
+        if (line ~ /(xray|x-ui|3x-ui|paqet|gfk|dangel)/) {
+          if (match($4, /:[0-9]+$/)) {
+            print substr($4, RSTART+1, RLENGTH-1)
+          }
+        }
+      }' || true)"
+    append_ports_var AUTO_UDP_PORTS "${ports}"
+  fi
+
   # Fallback: active listeners if no known config files and no detected ports
   if [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" ]] && have_cmd ss; then
-    ports="$(ss -tlnpH 2>/dev/null | awk '$4 !~ /^127\./ && $4 !~ /^\[::1\]/ {split($4,a,":"); print a[length(a)]}' || true)"
+    ports="$(ss -tlnpH 2>/dev/null | awk '
+      $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
+        if (match($4, /:[0-9]+$/)) {
+          print substr($4, RSTART+1, RLENGTH-1)
+        }
+      }' || true)"
     append_ports_var AUTO_TCP_PORTS "${ports}"
-    ports="$(ss -ulnpH 2>/dev/null | awk '$4 !~ /^127\./ && $4 !~ /^\[::1\]/ {split($4,a,":"); print a[length(a)]}' || true)"
+    ports="$(ss -ulnpH 2>/dev/null | awk '
+      $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
+        if (match($4, /:[0-9]+$/)) {
+          print substr($4, RSTART+1, RLENGTH-1)
+        }
+      }' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
   fi
 
