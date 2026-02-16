@@ -16,7 +16,6 @@ curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse
 ```
 
 اگر با خطای `/dev/fd/*` مواجه شدید، علتش این است که `sudo bash <(curl ...)` روی بعضی سرورها FDها را می‌بندد.
-```
 
 ## دستورات
 
