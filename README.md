@@ -23,6 +23,9 @@ curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse
 # نصب (auto-detect پورت‌ها فعال است)
 sudo ./abuse-guard.sh install --lockdown
 
+# اگر می‌خواهید fallback اسکن عمومی ss هم مجاز باشد (در lockdown ریسک باز شدن پورت‌های اضافی دارد)
+sudo ./abuse-guard.sh install --lockdown --allow-ss-fallback
+
 # کنترل دستی کامل (بدون auto-detect)
 sudo ./abuse-guard.sh install --lockdown --no-auto-detect --xray-ports "443,2053" --panel-ports "54321" --allow-in-udp "51820"
 
@@ -47,5 +50,7 @@ sudo /usr/local/sbin/abuse-guard uninstall
 - بلاک خروجی BitTorrent (پورت‌های رایج + در iptables تشخیص signature)
 - بلاک amplificationهای رایج (DNS/NTP/SSDP/Memcached)
 - rate limitهای ورودی/خروجی برای کاهش abuse
+
+نکته: در backend `nft` تشخیص DPI بیت‌تورنت وجود ندارد و فقط بلاک مبتنی بر پورت اعمال می‌شود.
 
 یادآوری: حفاظت واقعی DDoS عمدتاً سمت دیتاسنتر/پرووایدر است؛ این ابزار «baseline hardening» است.

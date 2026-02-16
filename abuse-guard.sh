@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.3.3"
+ABUSE_GUARD_VERSION="0.4.0"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -46,6 +46,7 @@ Options (install):
   --allow-in-tcp <list>           Extra inbound TCP ports (e.g. 80,51821)
   --allow-in-udp <list>           Extra inbound UDP ports (e.g. 51820)
   --no-auto-detect                Disable automatic port scanning
+  --allow-ss-fallback             Allow generic listener scan fallback (unsafe in lockdown)
   --no-sysctl                     Don't write /etc/sysctl.d/99-abuse-guard.conf
 
 What it does:
@@ -139,6 +140,7 @@ append_ports_var() {
 }
 
 auto_detect_ports() {
+  local allow_ss_fallback="${1:-0}"
   AUTO_TCP_PORTS=""
   AUTO_UDP_PORTS=""
   AUTO_DETECT_SOURCES=""
@@ -300,7 +302,7 @@ auto_detect_ports() {
   fi
 
   # Fallback: active listeners if no known config files and no detected ports
-  if [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" ]] && have_cmd ss; then
+  if [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" ]] && have_cmd ss && [[ "${allow_ss_fallback}" == "1" ]]; then
     ports="$(ss -tlnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         if (match($4, /:[0-9]+$/)) {
@@ -317,6 +319,8 @@ auto_detect_ports() {
       }' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
     [[ -n "${ports}" ]] && add_detect_source "ss-fallback"
+  elif [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" ]] && have_cmd ss; then
+    log "WARNING: no config/db ports detected and ss-fallback is disabled; use manual ports or --allow-ss-fallback."
   fi
 
   AUTO_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_TCP_PORTS}")")"
@@ -375,8 +379,11 @@ write_config() {
   local allow_in_udp="$7"
   local apply_sysctl="$8"
   local auto_detect="$9"
+  local allow_ss_fallback="${10}"
+  local old_umask
 
   mkdir -p "${config_dir}"
+  old_umask="$(umask)"
   umask 077
   cat >"${config_file}" <<EOF
 BACKEND="${backend}"
@@ -388,8 +395,10 @@ ALLOW_IN_TCP="${allow_in_tcp}"
 ALLOW_IN_UDP="${allow_in_udp}"
 APPLY_SYSCTL="${apply_sysctl}"
 AUTO_DETECT="${auto_detect}"
+ALLOW_SS_FALLBACK="${allow_ss_fallback}"
 EOF
   chmod 600 "${config_file}"
+  umask "${old_umask}"
 }
 
 trim_ws() {
@@ -415,6 +424,7 @@ read_config() {
   ALLOW_IN_UDP=""
   APPLY_SYSCTL=""
   AUTO_DETECT=""
+  ALLOW_SS_FALLBACK=""
 
   local key val line
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -444,6 +454,7 @@ read_config() {
       ALLOW_IN_UDP) ALLOW_IN_UDP="${val}" ;;
       APPLY_SYSCTL) APPLY_SYSCTL="${val}" ;;
       AUTO_DETECT) AUTO_DETECT="${val}" ;;
+      ALLOW_SS_FALLBACK) ALLOW_SS_FALLBACK="${val}" ;;
     esac
   done < "${config_file}"
 
@@ -458,6 +469,7 @@ read_config() {
   : "${ALLOW_IN_UDP:=}"
   : "${APPLY_SYSCTL:=1}"
   : "${AUTO_DETECT:=1}"
+  : "${ALLOW_SS_FALLBACK:=0}"
 }
 
 read_config_or_die() {
@@ -500,6 +512,7 @@ net.ipv4.tcp_rfc1337 = 1
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 EOF
+  chmod 0644 "${sysctl_file}"
 
   if have_cmd sysctl; then
     sysctl --system >/dev/null 2>&1 || true
@@ -569,7 +582,8 @@ table inet abuse_guard {
 
     # Inbound SYN flood / connection abuse control
     tcp flags syn limit rate over 20/second burst 40 packets drop
-    tcp dport @allowed_tcp_in meter per_ip_conns { ip saddr ct count over 100 } drop
+    tcp dport @allowed_tcp_in meter per_ip_conns_v4 { ip saddr ct count over 100 } drop
+    tcp dport @allowed_tcp_in meter per_ip_conns_v6 { ip6 saddr ct count over 100 } drop
 
     tcp dport @allowed_tcp_in accept
     udp dport @allowed_udp_in accept
@@ -632,9 +646,7 @@ nft_apply() {
 }
 
 nft_try_add_bittorrent_signature_rules() {
-  # nft raw payload matching is unreliable for variable-length TCP headers.
-  # BitTorrent protocol detection for deep inspection is handled by iptables xt_string.
-  # nft backend keeps port-based BitTorrent blocking.
+  log "WARNING: nft backend has no BitTorrent DPI; only port-based BitTorrent blocking is active."
   return 0
 }
 
@@ -677,7 +689,7 @@ iptables_apply_family() {
   local has_length="0"
 
   if [[ "${family}" == "v6" ]]; then
-    connlimit_mask="128"
+    connlimit_mask="64"
     icmp_proto="ipv6-icmp"
   fi
   "${ipt}" -m hashlimit --help >/dev/null 2>&1 && has_hashlimit="1" || has_hashlimit="0"
@@ -795,6 +807,9 @@ iptables_apply_family() {
 
 iptables_apply() {
   have_cmd iptables || die "iptables command not found"
+  if ! have_cmd ip6tables; then
+    log "WARNING: ip6tables not found, IPv6 traffic is NOT filtered on iptables backend."
+  fi
   iptables_apply_family "v4" "$@"
   iptables_apply_family "v6" "$@"
 }
@@ -816,7 +831,8 @@ write_systemd_unit() {
   cat >"${systemd_unit}" <<EOF
 [Unit]
 Description=abuse-guard firewall hardening
-After=network.target
+After=network-online.target nftables.service iptables.service ip6tables.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -827,6 +843,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 0644 "${systemd_unit}"
   systemctl daemon-reload
   systemctl enable --now abuse-guard.service >/dev/null 2>&1 || true
 }
@@ -850,6 +867,7 @@ cmd_install() {
   local allow_in_udp=""
   local apply_sysctl="1"
   local auto_detect="1"
+  local allow_ss_fallback="0"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -869,6 +887,8 @@ cmd_install() {
         allow_in_udp="${2:-}"; shift 2 ;;
       --no-auto-detect)
         auto_detect="0"; shift ;;
+      --allow-ss-fallback)
+        allow_ss_fallback="1"; shift ;;
       --no-sysctl)
         apply_sysctl="0"; shift ;;
       -h|--help)
@@ -884,7 +904,7 @@ cmd_install() {
 
   if [[ "${auto_detect}" == "1" ]]; then
     log "Auto-detecting tunnel/xray/panel ports..."
-    auto_detect_ports
+    auto_detect_ports "${allow_ss_fallback}"
     xray_ports="$(normalize_port_list "${xray_ports} ${AUTO_TCP_PORTS}")"
     allow_in_udp="$(normalize_port_list "${allow_in_udp} ${AUTO_UDP_PORTS}")"
     if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
@@ -921,7 +941,7 @@ cmd_install() {
     log "هشدار: firewalld فعال است. ممکن است قوانین تداخل داشته باشند."
   fi
 
-  write_config "${backend}" "${lockdown}" "${ssh_port}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}"
+  write_config "${backend}" "${lockdown}" "${ssh_port}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${allow_ss_fallback}"
   install_self
 
   if [[ "${apply_sysctl}" == "1" ]]; then
@@ -947,7 +967,7 @@ cmd_apply() {
   read_config_or_die
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
-    auto_detect_ports
+    auto_detect_ports "${ALLOW_SS_FALLBACK}"
     if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
       log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
       log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
@@ -1030,9 +1050,10 @@ cmd_status() {
   echo "allow_in_tcp=${ALLOW_IN_TCP}"
   echo "allow_in_udp=${ALLOW_IN_UDP}"
   echo "auto_detect=${AUTO_DETECT}"
+  echo "allow_ss_fallback=${ALLOW_SS_FALLBACK}"
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
-    auto_detect_ports
+    auto_detect_ports "${ALLOW_SS_FALLBACK}"
   else
     AUTO_TCP_PORTS=""
     AUTO_UDP_PORTS=""
