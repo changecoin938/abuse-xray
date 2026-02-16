@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.5.0"
+ABUSE_GUARD_VERSION="0.6.0"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
