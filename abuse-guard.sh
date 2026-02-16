@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.3.1"
+ABUSE_GUARD_VERSION="0.3.3"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -111,6 +111,20 @@ validate_ports_or_die() {
 
 AUTO_TCP_PORTS=""
 AUTO_UDP_PORTS=""
+AUTO_DETECT_SOURCES=""
+
+add_detect_source() {
+  local source="${1:-}"
+  [[ -z "${source}" ]] && return 0
+  case ",${AUTO_DETECT_SOURCES}," in
+    *",${source},"*) return 0 ;;
+  esac
+  if [[ -z "${AUTO_DETECT_SOURCES}" ]]; then
+    AUTO_DETECT_SOURCES="${source}"
+  else
+    AUTO_DETECT_SOURCES+=",${source}"
+  fi
+}
 
 append_ports_var() {
   local target="$1"
@@ -127,9 +141,17 @@ append_ports_var() {
 auto_detect_ports() {
   AUTO_TCP_PORTS=""
   AUTO_UDP_PORTS=""
+  AUTO_DETECT_SOURCES=""
 
-  local cfg db ports ports2
+  local cfg db ports ports2 ports3 svc xui_dir
   local found_config_files="0"
+
+  # X-UI / 3x-ui panel ports from running process (most reliable)
+  if have_cmd ss; then
+    ports="$(ss -tlnpH 2>/dev/null | grep -Ei 'x-ui|3x-ui|xui|xray' | awk '{ if (match($4, /:[0-9]+$/)) { print substr($4, RSTART+1, RLENGTH-1) } }' | sort -un || true)"
+    append_ports_var AUTO_TCP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "xui-ss"
+  fi
 
   # Xray JSON inbounds
   for cfg in /usr/local/etc/xray/*.json /etc/xray/*.json; do
@@ -137,18 +159,82 @@ auto_detect_ports() {
     found_config_files="1"
     ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "xray-json"
   done
+
+  # X-UI JSON config fallback
+  for cfg in /usr/local/x-ui/config.json /etc/x-ui/config.json /opt/x-ui/config.json /root/x-ui/config.json; do
+    [[ -f "${cfg}" ]] || continue
+    found_config_files="1"
+    ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*\"?[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+    append_ports_var AUTO_TCP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "xui-json"
+  done
+
+  # X-UI from systemd working directory (DB/config discovery)
+  if is_systemd; then
+    for svc in x-ui.service 3x-ui.service; do
+      xui_dir="$(systemctl show "${svc}" -p WorkingDirectory --value 2>/dev/null || true)"
+      [[ -n "${xui_dir}" && -d "${xui_dir}" ]] || continue
+      found_config_files="1"
+      for cfg in "${xui_dir}"/config.json "${xui_dir}"/config*.json; do
+        [[ -f "${cfg}" ]] || continue
+        ports="$(grep -oE '"port"[[:space:]]*:[[:space:]]*\"?[0-9]+' "${cfg}" 2>/dev/null | grep -oE '[0-9]+' || true)"
+        append_ports_var AUTO_TCP_PORTS "${ports}"
+        [[ -n "${ports}" ]] && add_detect_source "xui-systemd-json"
+      done
+      if have_cmd sqlite3; then
+        for db in "${xui_dir}"/*.db "${xui_dir}"/db/*.db; do
+          [[ -f "${db}" ]] || continue
+          local sqlite_hit="0"
+          ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
+          if [[ -z "${ports}" ]]; then
+            ports="$(sqlite3 "${db}" "SELECT value FROM setting WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
+          fi
+          [[ -n "${ports}" ]] && sqlite_hit="1"
+          append_ports_var AUTO_TCP_PORTS "${ports}"
+          ports2="$(sqlite3 "${db}" "SELECT port FROM inbounds WHERE enable=1" 2>/dev/null || true)"
+          [[ -n "${ports2}" ]] && sqlite_hit="1"
+          append_ports_var AUTO_TCP_PORTS "${ports2}"
+          ports3="$(sqlite3 "${db}" "SELECT port FROM inbound WHERE enable=1" 2>/dev/null || true)"
+          [[ -n "${ports3}" ]] && sqlite_hit="1"
+          append_ports_var AUTO_TCP_PORTS "${ports3}"
+          [[ "${sqlite_hit}" == "1" ]] && add_detect_source "xui-systemd-sqlite"
+        done
+      fi
+    done
+  fi
 
   # X-UI / 3x-ui panel port from sqlite
   if have_cmd sqlite3; then
-    for db in /etc/x-ui/x-ui.db /usr/local/x-ui/db/x-ui.db /usr/local/x-ui/*.db; do
+    for db in \
+      /etc/x-ui/x-ui.db \
+      /etc/x-ui/db/x-ui.db \
+      /usr/local/x-ui/db/x-ui.db \
+      /usr/local/x-ui/x-ui.db \
+      /opt/x-ui/x-ui.db \
+      /root/x-ui/x-ui.db \
+      /usr/local/x-ui/db/*.db \
+      /usr/local/x-ui/*.db \
+      /opt/x-ui/*.db \
+      /root/x-ui/*.db; do
       [[ -f "${db}" ]] || continue
       found_config_files="1"
-      ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key IN ('webPort','webport') LIMIT 1" 2>/dev/null || true)"
+      local sqlite_hit="0"
+      ports="$(sqlite3 "${db}" "SELECT value FROM settings WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
       if [[ -z "${ports}" ]]; then
-        ports="$(sqlite3 "${db}" "SELECT value FROM setting WHERE key IN ('webPort','webport') LIMIT 1" 2>/dev/null || true)"
+        ports="$(sqlite3 "${db}" "SELECT value FROM setting WHERE key IN ('webPort','web_port','webport','port') LIMIT 5" 2>/dev/null || true)"
       fi
+      [[ -n "${ports}" ]] && sqlite_hit="1"
       append_ports_var AUTO_TCP_PORTS "${ports}"
+
+      ports2="$(sqlite3 "${db}" "SELECT port FROM inbounds WHERE enable=1" 2>/dev/null || true)"
+      [[ -n "${ports2}" ]] && sqlite_hit="1"
+      append_ports_var AUTO_TCP_PORTS "${ports2}"
+      ports3="$(sqlite3 "${db}" "SELECT port FROM inbound WHERE enable=1" 2>/dev/null || true)"
+      [[ -n "${ports3}" ]] && sqlite_hit="1"
+      append_ports_var AUTO_TCP_PORTS "${ports3}"
+      [[ "${sqlite_hit}" == "1" ]] && add_detect_source "xui-sqlite"
     done
   fi
 
@@ -184,6 +270,7 @@ auto_detect_ports() {
   if have_cmd wg; then
     ports="$(wg show all listen-port 2>/dev/null | awk '{print $2}' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "wireguard"
   fi
 
   # Active listeners (best-effort): detect ports for relevant processes even if configs/db parsing is incomplete.
@@ -198,6 +285,7 @@ auto_detect_ports() {
         }
       }' || true)"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "ss-procs"
     ports="$(ss -ulnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         line=tolower($0)
@@ -208,6 +296,7 @@ auto_detect_ports() {
         }
       }' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "ss-procs"
   fi
 
   # Fallback: active listeners if no known config files and no detected ports
@@ -219,6 +308,7 @@ auto_detect_ports() {
         }
       }' || true)"
     append_ports_var AUTO_TCP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "ss-fallback"
     ports="$(ss -ulnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         if (match($4, /:[0-9]+$/)) {
@@ -226,6 +316,7 @@ auto_detect_ports() {
         }
       }' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
+    [[ -n "${ports}" ]] && add_detect_source "ss-fallback"
   fi
 
   AUTO_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_TCP_PORTS}")")"
@@ -796,8 +887,13 @@ cmd_install() {
     auto_detect_ports
     xray_ports="$(normalize_port_list "${xray_ports} ${AUTO_TCP_PORTS}")"
     allow_in_udp="$(normalize_port_list "${allow_in_udp} ${AUTO_UDP_PORTS}")"
-    log "Detected TCP ports: ${AUTO_TCP_PORTS:-none}"
-    log "Detected UDP ports: ${AUTO_UDP_PORTS:-none}"
+    if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
+      log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
+      log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
+      [[ -n "${AUTO_DETECT_SOURCES}" ]] && log "Auto-detect sources: ${AUTO_DETECT_SOURCES}"
+    else
+      log "Warning: no ports auto-detected. Use --xray-ports and --panel-ports manually."
+    fi
   fi
 
   xray_ports="$(dedup_ports "$(normalize_port_list "${xray_ports}")")"
@@ -852,6 +948,13 @@ cmd_apply() {
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
     auto_detect_ports
+    if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
+      log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
+      log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
+      [[ -n "${AUTO_DETECT_SOURCES}" ]] && log "Auto-detect sources: ${AUTO_DETECT_SOURCES}"
+    else
+      log "Warning: no ports auto-detected. Use --xray-ports and --panel-ports manually."
+    fi
     XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${XRAY_PORTS} ${AUTO_TCP_PORTS}")")"
     ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${ALLOW_IN_UDP} ${AUTO_UDP_PORTS}")")"
   else
