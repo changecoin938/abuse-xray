@@ -26,6 +26,12 @@ sudo ./abuse-guard.sh install --lockdown
 # اگر می‌خواهید fallback اسکن عمومی ss هم مجاز باشد (در lockdown ریسک باز شدن پورت‌های اضافی دارد)
 sudo ./abuse-guard.sh install --lockdown --allow-ss-fallback
 
+# رفرش خودکار قوانین هر 5 دقیقه (پیش‌فرض)، یا مقدار دلخواه
+sudo ./abuse-guard.sh install --lockdown --refresh-interval 300
+
+# غیرفعال‌کردن رفرش دوره‌ای
+sudo ./abuse-guard.sh install --lockdown --refresh-interval 0
+
 # اگر UFW/firewalld فعال است و با آگاهی می‌خواهید ادامه دهید
 sudo ./abuse-guard.sh install --lockdown --force
 

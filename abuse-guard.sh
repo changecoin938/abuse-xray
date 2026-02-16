@@ -47,6 +47,7 @@ Options (install):
   --allow-in-udp <list>           Extra inbound UDP ports (e.g. 51820)
   --no-auto-detect                Disable automatic port scanning
   --allow-ss-fallback             Allow generic listener scan fallback (unsafe in lockdown)
+  --refresh-interval <seconds>    Auto-apply interval via systemd timer (default: 300, 0=disable)
   --force                         Ignore UFW/firewalld conflict checks
   --no-sysctl                     Don't write /etc/sysctl.d/99-abuse-guard.conf
 
@@ -65,6 +66,7 @@ What it does:
 Notes:
   - Full DDoS protection is mostly provider/network-side; this is baseline hardening.
   - "Ban torrent user" at firewall is not reliable for Xray/proxy traffic; best is block BT traffic.
+  - If netfilter-persistent exists, avoid running "netfilter-persistent save" while abuse-guard is active.
 EOF
 }
 
@@ -448,8 +450,11 @@ config_file="${config_dir}/config.env"
 sysctl_file="/etc/sysctl.d/99-abuse-guard.conf"
 nft_file="${config_dir}/abuse-guard.nft"
 systemd_unit="/etc/systemd/system/abuse-guard.service"
+refresh_service_unit="/etc/systemd/system/abuse-guard-refresh.service"
+refresh_timer_unit="/etc/systemd/system/abuse-guard-refresh.timer"
 installed_bin="/usr/local/sbin/abuse-guard"
 script_raw_url="https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh"
+PIPE_SCRIPT_CACHE=""
 
 write_config() {
   local backend="$1"
@@ -462,6 +467,7 @@ write_config() {
   local apply_sysctl="$8"
   local auto_detect="$9"
   local allow_ss_fallback="${10}"
+  local refresh_interval="${11}"
   local old_umask
 
   mkdir -p "${config_dir}"
@@ -478,6 +484,7 @@ ALLOW_IN_UDP="${allow_in_udp}"
 APPLY_SYSCTL="${apply_sysctl}"
 AUTO_DETECT="${auto_detect}"
 ALLOW_SS_FALLBACK="${allow_ss_fallback}"
+REFRESH_INTERVAL="${refresh_interval}"
 EOF
   chmod 0644 "${config_file}"
   umask "${old_umask}"
@@ -507,6 +514,7 @@ read_config() {
   APPLY_SYSCTL=""
   AUTO_DETECT=""
   ALLOW_SS_FALLBACK=""
+  REFRESH_INTERVAL=""
 
   local key val line
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -537,6 +545,7 @@ read_config() {
       APPLY_SYSCTL) APPLY_SYSCTL="${val}" ;;
       AUTO_DETECT) AUTO_DETECT="${val}" ;;
       ALLOW_SS_FALLBACK) ALLOW_SS_FALLBACK="${val}" ;;
+      REFRESH_INTERVAL) REFRESH_INTERVAL="${val}" ;;
     esac
   done < "${config_file}"
 
@@ -552,6 +561,7 @@ read_config() {
   : "${APPLY_SYSCTL:=1}"
   : "${AUTO_DETECT:=1}"
   : "${ALLOW_SS_FALLBACK:=0}"
+  : "${REFRESH_INTERVAL:=300}"
 }
 
 read_config_or_die() {
@@ -569,13 +579,35 @@ detect_running_script_source() {
   return 1
 }
 
+cache_piped_script_source() {
+  local candidate
+  local cache_path="/tmp/.abuse-guard-install-src.$$"
+  [[ -f "$0" ]] && return 0
+  for candidate in "${BASH_SOURCE[0]:-}" /proc/$$/fd/255 /proc/self/fd/255 /proc/self/fd/0 /dev/fd/0; do
+    [[ -n "${candidate}" ]] || continue
+    [[ -r "${candidate}" ]] || continue
+    if cat "${candidate}" > "${cache_path}" 2>/dev/null && [[ -s "${cache_path}" ]]; then
+      PIPE_SCRIPT_CACHE="${cache_path}"
+      return 0
+    fi
+  done
+  rm -f "${cache_path}" 2>/dev/null || true
+  PIPE_SCRIPT_CACHE=""
+  return 1
+}
+
 install_self() {
   local src=""
   mkdir -p "$(dirname "${installed_bin}")"
   # Copy current running script to stable path for systemd.
   # Prefer local source over network download to avoid version drift.
   if [[ "${0}" != "${installed_bin}" ]]; then
-    if src="$(detect_running_script_source)"; then
+    if [[ -n "${PIPE_SCRIPT_CACHE}" && -s "${PIPE_SCRIPT_CACHE}" ]]; then
+      src="${PIPE_SCRIPT_CACHE}"
+      if ! cat "${src}" > "${installed_bin}"; then
+        src=""
+      fi
+    elif src="$(detect_running_script_source)"; then
       if ! cat "${src}" > "${installed_bin}"; then
         src=""
       fi
@@ -748,7 +780,59 @@ nft_apply() {
   nft -f "${nft_file}"
 }
 
+iptables_bt_dpi_chain_name="ABUSE_GUARD_BT_DPI"
+iptables_chain_name_in="ABUSE_GUARD_IN"
+iptables_chain_name_out="ABUSE_GUARD_OUT"
+
+iptables_bt_dpi_apply_family() {
+  local family="${1:-v4}"
+  local ipt="iptables"
+  if [[ "${family}" == "v6" ]]; then
+    ipt="ip6tables"
+  fi
+  have_cmd "${ipt}" || return 1
+  "${ipt}" -m string --help >/dev/null 2>&1 || return 1
+
+  "${ipt}" -N "${iptables_bt_dpi_chain_name}" 2>/dev/null || true
+  "${ipt}" -F "${iptables_bt_dpi_chain_name}" || true
+  "${ipt}" -C OUTPUT -j "${iptables_bt_dpi_chain_name}" 2>/dev/null || "${ipt}" -I OUTPUT 1 -j "${iptables_bt_dpi_chain_name}"
+
+  "${ipt}" -A "${iptables_bt_dpi_chain_name}" -p tcp -m string --string "BitTorrent protocol" --algo bm -j DROP
+  "${ipt}" -A "${iptables_bt_dpi_chain_name}" -p tcp -m string --string "d1:ad2:id20:" --algo bm -j DROP
+  "${ipt}" -A "${iptables_bt_dpi_chain_name}" -p udp -m string --string "d1:ad2:id20:" --algo bm -j DROP
+  "${ipt}" -A "${iptables_bt_dpi_chain_name}" -j RETURN
+  return 0
+}
+
+nft_supplement_bittorrent_dpi() {
+  local enabled="0"
+  if iptables_bt_dpi_apply_family "v4"; then
+    enabled="1"
+  fi
+  if have_cmd ip6tables && iptables_bt_dpi_apply_family "v6"; then
+    enabled="1"
+  fi
+  if [[ "${enabled}" == "1" ]]; then
+    log "Enabled supplemental iptables BitTorrent DPI for nft backend."
+    return 0
+  fi
+  return 1
+}
+
+nft_cleanup_bittorrent_dpi() {
+  local ipt
+  for ipt in iptables ip6tables; do
+    have_cmd "${ipt}" || continue
+    while "${ipt}" -D OUTPUT -j "${iptables_bt_dpi_chain_name}" 2>/dev/null; do :; done
+    "${ipt}" -F "${iptables_bt_dpi_chain_name}" 2>/dev/null || true
+    "${ipt}" -X "${iptables_bt_dpi_chain_name}" 2>/dev/null || true
+  done
+}
+
 nft_try_add_bittorrent_signature_rules() {
+  if nft_supplement_bittorrent_dpi; then
+    return 0
+  fi
   log "WARNING: nft backend has no BitTorrent DPI; only port-based BitTorrent blocking is active."
   return 0
 }
@@ -757,11 +841,9 @@ nft_uninstall() {
   if have_cmd nft; then
     nft delete table inet abuse_guard 2>/dev/null || true
   fi
+  nft_cleanup_bittorrent_dpi
   rm -f "${nft_file}"
 }
-
-iptables_chain_name_in="ABUSE_GUARD_IN"
-iptables_chain_name_out="ABUSE_GUARD_OUT"
 
 iptables_apply_family() {
   local family="$1" # v4 or v6
@@ -925,6 +1007,9 @@ iptables_apply() {
 iptables_uninstall() {
   for ipt in iptables ip6tables; do
     have_cmd "${ipt}" || continue
+    while "${ipt}" -D OUTPUT -j "${iptables_bt_dpi_chain_name}" 2>/dev/null; do :; done
+    "${ipt}" -F "${iptables_bt_dpi_chain_name}" 2>/dev/null || true
+    "${ipt}" -X "${iptables_bt_dpi_chain_name}" 2>/dev/null || true
     while "${ipt}" -D INPUT -j "${iptables_chain_name_in}" 2>/dev/null; do :; done
     while "${ipt}" -D OUTPUT -j "${iptables_chain_name_out}" 2>/dev/null; do :; done
     "${ipt}" -F "${iptables_chain_name_in}" 2>/dev/null || true
@@ -956,10 +1041,60 @@ EOF
   systemctl enable --now abuse-guard.service >/dev/null 2>&1 || true
 }
 
+write_refresh_units() {
+  local refresh_interval="${1:-300}"
+  is_systemd || return 0
+  if ! [[ "${refresh_interval}" =~ ^[0-9]+$ ]]; then
+    die "Invalid refresh interval: ${refresh_interval}"
+  fi
+  if (( refresh_interval <= 0 )); then
+    rm -f "${refresh_service_unit}" "${refresh_timer_unit}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl disable --now abuse-guard-refresh.timer >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  cat >"${refresh_service_unit}" <<EOF
+[Unit]
+Description=abuse-guard periodic refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${installed_bin} apply
+EOF
+
+  cat >"${refresh_timer_unit}" <<EOF
+[Unit]
+Description=abuse-guard refresh timer
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=${refresh_interval}s
+AccuracySec=30s
+Unit=abuse-guard-refresh.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 0644 "${refresh_service_unit}" "${refresh_timer_unit}"
+  systemctl daemon-reload
+  systemctl enable --now abuse-guard-refresh.timer >/dev/null 2>&1 || true
+}
+
 remove_systemd_unit() {
   is_systemd || return 0
   systemctl disable --now abuse-guard.service >/dev/null 2>&1 || true
   rm -f "${systemd_unit}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+remove_refresh_units() {
+  is_systemd || return 0
+  systemctl disable --now abuse-guard-refresh.timer >/dev/null 2>&1 || true
+  systemctl disable --now abuse-guard-refresh.service >/dev/null 2>&1 || true
+  rm -f "${refresh_timer_unit}" "${refresh_service_unit}"
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
@@ -976,6 +1111,7 @@ cmd_install() {
   local apply_sysctl="1"
   local auto_detect="1"
   local allow_ss_fallback="0"
+  local refresh_interval="300"
   local force="0"
 
   while [[ $# -gt 0 ]]; do
@@ -998,6 +1134,8 @@ cmd_install() {
         auto_detect="0"; shift ;;
       --allow-ss-fallback)
         allow_ss_fallback="1"; shift ;;
+      --refresh-interval)
+        refresh_interval="${2:-}"; shift 2 ;;
       --force)
         force="1"; shift ;;
       --no-sysctl)
@@ -1012,6 +1150,7 @@ cmd_install() {
   if [[ -z "${ssh_port}" ]]; then
     ssh_port="$(detect_ssh_port)"
   fi
+  [[ "${refresh_interval}" =~ ^[0-9]+$ ]] || die "--refresh-interval باید عدد صحیح >= 0 باشد"
 
   if [[ "${auto_detect}" == "1" ]]; then
     log "Auto-detecting tunnel/xray/panel ports..."
@@ -1062,8 +1201,12 @@ cmd_install() {
   if [[ "${firewall_conflict}" == "1" && "${force}" == "1" ]]; then
     log "WARNING: --force enabled; continuing despite firewall conflict."
   fi
+  if have_cmd netfilter-persistent; then
+    log "WARNING: netfilter-persistent detected; avoid 'netfilter-persistent save' while abuse-guard is active."
+    log "WARNING: run 'abuse-guard uninstall' before persisting firewall state."
+  fi
 
-  write_config "${backend}" "${lockdown}" "${ssh_port}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${allow_ss_fallback}"
+  write_config "${backend}" "${lockdown}" "${ssh_port}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${allow_ss_fallback}" "${refresh_interval}"
   install_self
 
   if [[ "${apply_sysctl}" == "1" ]]; then
@@ -1074,6 +1217,7 @@ cmd_install() {
   "${installed_bin}" apply
 
   write_systemd_unit
+  write_refresh_units "${refresh_interval}"
 
   log "نصب شد. وضعیت:"
   "${installed_bin}" status || true
@@ -1087,6 +1231,7 @@ cmd_install() {
 cmd_apply() {
   need_root
   read_config_or_die
+  write_refresh_units "${REFRESH_INTERVAL}"
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
     auto_detect_ports "${ALLOW_SS_FALLBACK}"
@@ -1144,6 +1289,7 @@ cmd_uninstall() {
   fi
 
   remove_systemd_unit
+  remove_refresh_units
 
   case "${BACKEND:-}" in
     nft) nft_uninstall ;;
@@ -1158,6 +1304,9 @@ cmd_uninstall() {
   rmdir "${config_dir}" 2>/dev/null || true
   if have_cmd sysctl; then
     sysctl --system >/dev/null 2>&1 || true
+  fi
+  if have_cmd netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 || log "WARNING: netfilter-persistent save failed; check persistent rules manually."
   fi
 
   log "حذف شد."
@@ -1183,6 +1332,7 @@ cmd_status() {
   echo "allow_in_udp=${ALLOW_IN_UDP}"
   echo "auto_detect=${AUTO_DETECT}"
   echo "allow_ss_fallback=${ALLOW_SS_FALLBACK}"
+  echo "refresh_interval=${REFRESH_INTERVAL}"
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
     auto_detect_ports "${ALLOW_SS_FALLBACK}"
@@ -1224,6 +1374,8 @@ cmd_status() {
 
 main() {
   local cmd="${1:-}"
+  cache_piped_script_source || true
+  trap 'if [[ -n "${PIPE_SCRIPT_CACHE:-}" ]]; then rm -f "${PIPE_SCRIPT_CACHE}" 2>/dev/null || true; fi' EXIT
   case "${cmd}" in
     install) shift; cmd_install "$@" ;;
     apply) shift; cmd_apply "$@" ;;
