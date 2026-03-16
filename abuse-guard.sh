@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.7.1"
+ABUSE_GUARD_VERSION="0.7.2"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -497,7 +497,7 @@ auto_detect_ports() {
   AUTO_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_TCP_PORTS}")")"
   AUTO_UDP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_UDP_PORTS}")")"
   AUTO_PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_PANEL_PORTS}")")"
-  if [[ -n "${AUTO_DETECT_FAMILIES}" ]] && [[ "$(wc -w <<<"${AUTO_DETECT_FAMILIES}" | tr -d ' ')" == "1" ]]; then
+  if [[ -n "${AUTO_DETECT_FAMILIES}" ]] && [[ "$(printf '%s\n' "${AUTO_DETECT_FAMILIES}" | tr ',' '\n' | awk 'NF{c++} END{print c+0}')" == "1" ]]; then
     AUTO_SINGLE_SERVICE_FAMILY="1"
   fi
 }
