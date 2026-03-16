@@ -5,8 +5,8 @@
 ## نصب یک خطی
 
 ```bash
-# آخرین نسخه از branch اصلی
-curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh | sudo bash -s -- install --lockdown
+# نودهای چرخشی/عمومی: تمام listenerهای عمومیِ شناخته‌شده باز می‌مانند
+curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh | sudo bash -s -- install --lockdown --compat-public-node
 ```
 
 اگر خودتان `root` هستید:
@@ -23,8 +23,12 @@ curl -fsSL https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse
 # نصب پیشنهادی برای mixed public node: listenerها را صریح بده
 sudo ./abuse-guard.sh install --lockdown --no-auto-detect --listeners-file ./listeners.example.conf
 
+# اگر نودها چرخشی هستند و نمی‌خواهی panel/service را دستی تفکیک کنی،
+# تمام listenerهای عمومیِ شناخته‌شده باز می‌مانند
+sudo ./abuse-guard.sh install --lockdown --compat-public-node
+
 # اگر هر سرور فقط یک سرویس اصلی دارد و همان سرویس الان در حال listen است،
-# auto-detect جدید از listener فعال امن‌تر از قبل کار می‌کند
+# mode سخت‌گیرانه‌تر single-service:
 sudo ./abuse-guard.sh install --lockdown
 
 # اگر panel مدیریتی هم عمداً باید با auto-detect باز بماند، این فلگ را صریح بده
@@ -74,8 +78,12 @@ sudo /usr/local/sbin/abuse-guard uninstall
 و `status` نشان می‌دهد دقیقاً یک `auto_detect_families` عمومی دیده شده،
 auto-detect جدید از روی listener فعال همان سرویس کار می‌کند و از config حدسی امن‌تر است.
 
-در این حالت، panelهای مدیریتی مثل `x-ui/3x-ui` به‌صورت پیش‌فرض auto-allow نمی‌شوند؛
-اگر واقعاً لازم است public بمانند، باید یا دستی در manifest/`--panel-ports` بدهی یا `--auto-allow-panels` را آگاهانه فعال کنی.
+اگر نودها چرخشی هستند و نمی‌خواهی بین panel/service تصمیم دستی بگیری،
+`--compat-public-node` مناسب‌تر است: تمام listenerهای عمومیِ شناخته‌شده‌ی سرویس‌ها و panelها
+در هر refresh باز می‌مانند، بدون اینکه generic fallback ناشناس باز شود.
+
+در mode سخت‌گیرانه‌تر single-service، panelهای مدیریتی مثل `x-ui/3x-ui` به‌صورت پیش‌فرض auto-allow نمی‌شوند؛
+اگر می‌خواهی بیرون از `--compat-public-node` هم public بمانند، باید یا دستی در manifest/`--panel-ports` بدهی یا `--auto-allow-panels` را فعال کنی.
 
 اگر سرور mixed است، یا سرویس هنوز بالا نیامده، یا قبل از deploy می‌خواهی lockdown بزنی،
 روش پیشنهادی این است که به auto-detect تکیه نکنی و listenerهای واقعی TCP/UDP را در فایل manifest صریح بدهی.

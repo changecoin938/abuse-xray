@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.7.2"
+ABUSE_GUARD_VERSION="0.7.3"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -48,6 +48,7 @@ Options (install):
   --listeners-file <path>         Explicit listener manifest (recommended for mixed public nodes)
   --no-auto-detect                Disable automatic port scanning
   --merge-auto-detect             Keep auto-detect enabled even when --listeners-file is provided
+  --compat-public-node            Keep all detected public listeners from supported services/panels open (for rotating public nodes)
   --auto-allow-panels             Auto-allow detected public x-ui/3x-ui panel ports (default: off)
   --allow-ss-fallback             Allow generic listener scan fallback (unsafe in lockdown)
   --allow-unsafe-lockdown-auto    Allow lockdown with auto-detect-only listeners (not recommended)
@@ -551,6 +552,7 @@ PIPE_SCRIPT_CACHE=""
 LISTENERS_FILE=""
 ALLOW_UNSAFE_LOCKDOWN_AUTO=""
 AUTO_ALLOW_PANELS=""
+COMPAT_PUBLIC_NODE=""
 EFFECTIVE_SSH_PORT=""
 EFFECTIVE_XRAY_PORTS=""
 EFFECTIVE_PANEL_PORTS=""
@@ -571,14 +573,15 @@ write_config() {
   local apply_sysctl="${10}"
   local auto_detect="${11}"
   local auto_allow_panels="${12}"
-  local allow_ss_fallback="${13}"
-  local allow_unsafe_lockdown_auto="${14}"
-  local refresh_interval="${15}"
-  local inbound_syn_rate="${16}"
-  local inbound_syn_burst="${17}"
-  local per_ip_conn_cap="${18}"
-  local outbound_syn_rate="${19}"
-  local outbound_syn_burst="${20}"
+  local compat_public_node="${13}"
+  local allow_ss_fallback="${14}"
+  local allow_unsafe_lockdown_auto="${15}"
+  local refresh_interval="${16}"
+  local inbound_syn_rate="${17}"
+  local inbound_syn_burst="${18}"
+  local per_ip_conn_cap="${19}"
+  local outbound_syn_rate="${20}"
+  local outbound_syn_burst="${21}"
   local old_umask
 
   mkdir -p "${config_dir}"
@@ -601,6 +604,7 @@ MANUAL_ALLOW_IN_UDP="${allow_in_udp}"
 APPLY_SYSCTL="${apply_sysctl}"
 AUTO_DETECT="${auto_detect}"
 AUTO_ALLOW_PANELS="${auto_allow_panels}"
+COMPAT_PUBLIC_NODE="${compat_public_node}"
 ALLOW_SS_FALLBACK="${allow_ss_fallback}"
 ALLOW_UNSAFE_LOCKDOWN_AUTO="${allow_unsafe_lockdown_auto}"
 REFRESH_INTERVAL="${refresh_interval}"
@@ -689,6 +693,7 @@ read_config() {
   APPLY_SYSCTL=""
   AUTO_DETECT=""
   AUTO_ALLOW_PANELS=""
+  COMPAT_PUBLIC_NODE=""
   ALLOW_SS_FALLBACK=""
   ALLOW_UNSAFE_LOCKDOWN_AUTO=""
   REFRESH_INTERVAL=""
@@ -734,6 +739,7 @@ read_config() {
       APPLY_SYSCTL) APPLY_SYSCTL="${val}" ;;
       AUTO_DETECT) AUTO_DETECT="${val}" ;;
       AUTO_ALLOW_PANELS) AUTO_ALLOW_PANELS="${val}" ;;
+      COMPAT_PUBLIC_NODE) COMPAT_PUBLIC_NODE="${val}" ;;
       ALLOW_SS_FALLBACK) ALLOW_SS_FALLBACK="${val}" ;;
       ALLOW_UNSAFE_LOCKDOWN_AUTO) ALLOW_UNSAFE_LOCKDOWN_AUTO="${val}" ;;
       REFRESH_INTERVAL) REFRESH_INTERVAL="${val}" ;;
@@ -766,6 +772,7 @@ read_config() {
   : "${APPLY_SYSCTL:=1}"
   : "${AUTO_DETECT:=1}"
   : "${AUTO_ALLOW_PANELS:=0}"
+  : "${COMPAT_PUBLIC_NODE:=0}"
   : "${ALLOW_SS_FALLBACK:=0}"
   : "${ALLOW_UNSAFE_LOCKDOWN_AUTO:=0}"
   : "${REFRESH_INTERVAL:=300}"
@@ -801,7 +808,7 @@ refresh_runtime_ports() {
   if [[ "${AUTO_DETECT}" == "1" ]]; then
     auto_detect_ports "${ALLOW_SS_FALLBACK}"
     EFFECTIVE_XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_XRAY_PORTS} ${AUTO_TCP_PORTS}")")"
-    if [[ "${AUTO_ALLOW_PANELS}" == "1" ]]; then
+    if [[ "${AUTO_ALLOW_PANELS}" == "1" || "${COMPAT_PUBLIC_NODE}" == "1" ]]; then
       EFFECTIVE_PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_PANEL_PORTS} ${AUTO_PANEL_PORTS}")")"
     fi
     EFFECTIVE_ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_ALLOW_IN_UDP} ${AUTO_UDP_PORTS}")")"
@@ -826,6 +833,22 @@ detect_running_script_source() {
     echo "${candidate}"
     return 0
   done
+  return 1
+}
+
+trusted_auto_detect_for_lockdown() {
+  if [[ "${AUTO_DETECT_USED_GENERIC_FALLBACK}" == "1" ]]; then
+    return 1
+  fi
+  if [[ "${COMPAT_PUBLIC_NODE}" == "1" ]]; then
+    if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" || -n "${AUTO_PANEL_PORTS}" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" && "${AUTO_SINGLE_SERVICE_FAMILY}" == "1" ]]; then
+    return 0
+  fi
   return 1
 }
 
@@ -1431,6 +1454,7 @@ cmd_install() {
   local auto_detect="1"
   local merge_auto_detect="0"
   local auto_allow_panels="0"
+  local compat_public_node="0"
   local allow_ss_fallback="0"
   local allow_unsafe_lockdown_auto="0"
   local inbound_syn_rate="0"
@@ -1463,6 +1487,8 @@ cmd_install() {
         auto_detect="0"; shift ;;
       --merge-auto-detect)
         merge_auto_detect="1"; shift ;;
+      --compat-public-node)
+        compat_public_node="1"; shift ;;
       --auto-allow-panels)
         auto_allow_panels="1"; shift ;;
       --allow-ss-fallback)
@@ -1520,7 +1546,7 @@ cmd_install() {
       log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
       log "Auto-detected Panel: ${AUTO_PANEL_PORTS:-none}"
       log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
-      if [[ -n "${AUTO_PANEL_PORTS}" && "${auto_allow_panels}" != "1" ]]; then
+      if [[ -n "${AUTO_PANEL_PORTS}" && "${auto_allow_panels}" != "1" && "${compat_public_node}" != "1" ]]; then
         log "Detected public panel ports will not be auto-allowed unless --auto-allow-panels is set."
       fi
       [[ -n "${AUTO_DETECT_SOURCES}" ]] && log "Auto-detect sources: ${AUTO_DETECT_SOURCES}"
@@ -1540,10 +1566,18 @@ cmd_install() {
   validate_ports_or_die "${allow_in_tcp}"
   validate_ports_or_die "${allow_in_udp}"
   if [[ "${lockdown}" == "1" && "${auto_detect}" == "1" && -z "${listeners_file}" && -z "${xray_ports}" && -z "${panel_ports}" && -z "${allow_in_tcp}" && -z "${allow_in_udp}" && "${allow_unsafe_lockdown_auto}" != "1" ]]; then
-    if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" && "${AUTO_DETECT_USED_GENERIC_FALLBACK}" != "1" && "${AUTO_SINGLE_SERVICE_FAMILY}" == "1" ]]; then
-      log "Using active listener auto-detect for single-service node: ${AUTO_DETECT_FAMILIES:-unknown}"
+    if trusted_auto_detect_for_lockdown; then
+      if [[ "${compat_public_node}" == "1" ]]; then
+        log "Using compatibility auto-detect for public node families: ${AUTO_DETECT_FAMILIES:-panel-only}"
+      else
+        log "Using active listener auto-detect for single-service node: ${AUTO_DETECT_FAMILIES:-unknown}"
+      fi
     else
-      die "برای lockdown بدون پورت دستی/manifest باید دقیقاً یک family سرویس عمومیِ در حال listen داشته باشی تا auto-detect قابل اعتماد باشد. در غیر این صورت از --listeners-file یا پورت‌های دستی استفاده کن."
+      if [[ "${compat_public_node}" == "1" ]]; then
+        die "برای compat-public-node باید listener عمومیِ شناخته‌شده داشته باشی و generic ss fallback هم استفاده نشده باشد."
+      else
+        die "برای lockdown بدون پورت دستی/manifest باید دقیقاً یک family سرویس عمومیِ در حال listen داشته باشی تا auto-detect قابل اعتماد باشد. در غیر این صورت از --listeners-file یا پورت‌های دستی استفاده کن."
+      fi
     fi
   fi
   if [[ -n "${listeners_file}" ]]; then
@@ -1580,7 +1614,7 @@ cmd_install() {
     log "WARNING: run 'abuse-guard uninstall' before persisting firewall state."
   fi
 
-  write_config "${backend}" "${lockdown}" "${ssh_port}" "${ssh_port_source}" "${listeners_file}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${auto_allow_panels}" "${allow_ss_fallback}" "${allow_unsafe_lockdown_auto}" "${refresh_interval}" "${inbound_syn_rate}" "${inbound_syn_burst}" "${per_ip_conn_cap}" "${outbound_syn_rate}" "${outbound_syn_burst}"
+  write_config "${backend}" "${lockdown}" "${ssh_port}" "${ssh_port_source}" "${listeners_file}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${auto_allow_panels}" "${compat_public_node}" "${allow_ss_fallback}" "${allow_unsafe_lockdown_auto}" "${refresh_interval}" "${inbound_syn_rate}" "${inbound_syn_burst}" "${per_ip_conn_cap}" "${outbound_syn_rate}" "${outbound_syn_burst}"
   install_self
   write_listeners_example
 
@@ -1626,10 +1660,18 @@ cmd_apply() {
   write_refresh_units "${REFRESH_INTERVAL}"
   refresh_runtime_ports
   if [[ "${LOCKDOWN}" == "1" && "${AUTO_DETECT}" == "1" ]] && ! has_explicit_listener_config && [[ "${ALLOW_UNSAFE_LOCKDOWN_AUTO}" != "1" ]]; then
-    if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" && "${AUTO_DETECT_USED_GENERIC_FALLBACK}" != "1" && "${AUTO_SINGLE_SERVICE_FAMILY}" == "1" ]]; then
-      log "Using active listener auto-detect for single-service node: ${AUTO_DETECT_FAMILIES:-unknown}"
+    if trusted_auto_detect_for_lockdown; then
+      if [[ "${COMPAT_PUBLIC_NODE}" == "1" ]]; then
+        log "Using compatibility auto-detect for public node families: ${AUTO_DETECT_FAMILIES:-panel-only}"
+      else
+        log "Using active listener auto-detect for single-service node: ${AUTO_DETECT_FAMILIES:-unknown}"
+      fi
     else
-      log "WARNING: lockdown is running without explicit ports and without trusted single-service active-listener detection."
+      if [[ "${COMPAT_PUBLIC_NODE}" == "1" ]]; then
+        log "WARNING: compat-public-node could not find trusted supported public listeners."
+      else
+        log "WARNING: lockdown is running without explicit ports and without trusted single-service active-listener detection."
+      fi
       log "WARNING: for this server, use LISTENERS_FILE or explicit manual ports."
     fi
   fi
@@ -1730,6 +1772,7 @@ cmd_status() {
   echo "effective_allow_in_udp=${EFFECTIVE_ALLOW_IN_UDP}"
   echo "auto_detect=${AUTO_DETECT}"
   echo "auto_allow_panels=${AUTO_ALLOW_PANELS}"
+  echo "compat_public_node=${COMPAT_PUBLIC_NODE}"
   echo "allow_ss_fallback=${ALLOW_SS_FALLBACK}"
   echo "allow_unsafe_lockdown_auto=${ALLOW_UNSAFE_LOCKDOWN_AUTO}"
   echo "refresh_interval=${REFRESH_INTERVAL}"
