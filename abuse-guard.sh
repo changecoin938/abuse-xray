@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ABUSE_GUARD_VERSION="0.6.0"
+ABUSE_GUARD_VERSION="0.7.1"
 ABUSE_GUARD_NAME="abuse-guard"
 
 die() {
@@ -45,8 +45,17 @@ Options (install):
   --panel-ports <list>            Comma/space list (e.g. 54321)
   --allow-in-tcp <list>           Extra inbound TCP ports (e.g. 80,51821)
   --allow-in-udp <list>           Extra inbound UDP ports (e.g. 51820)
+  --listeners-file <path>         Explicit listener manifest (recommended for mixed public nodes)
   --no-auto-detect                Disable automatic port scanning
+  --merge-auto-detect             Keep auto-detect enabled even when --listeners-file is provided
+  --auto-allow-panels             Auto-allow detected public x-ui/3x-ui panel ports (default: off)
   --allow-ss-fallback             Allow generic listener scan fallback (unsafe in lockdown)
+  --allow-unsafe-lockdown-auto    Allow lockdown with auto-detect-only listeners (not recommended)
+  --in-syn-rate <n>               Per-source inbound TCP SYN/sec limit for managed TCP ports (0=off, default: 0)
+  --in-syn-burst <n>              Burst for --in-syn-rate (default: 40)
+  --per-ip-conn-cap <n>           Per-source concurrent inbound TCP cap for managed TCP ports (0=off, default: 0)
+  --out-syn-rate <n>              Per-destination outbound TCP SYN/sec limit (0=off, default: 0)
+  --out-syn-burst <n>             Burst for --out-syn-rate (default: 100)
   --refresh-interval <seconds>    Auto-apply interval via systemd timer (default: 300, 0=disable)
   --force                         Ignore UFW/firewalld conflict checks
   --no-sysctl                     Don't write /etc/sysctl.d/99-abuse-guard.conf
@@ -56,8 +65,8 @@ What it does:
   - Blocks outbound BitTorrent ports + protocol signature detection (iptables/xt_string)
   - Blocks outbound DNS/NTP/SSDP/Memcached amplification vectors
   - Blocks outbound IRC (6667/6697) for botnet C2 reduction
-  - Per-IP inbound SYN rate limiting + concurrent connection limits
-  - Outbound new TCP connection rate limiting (anti scan/flood)
+  - Optional per-IP inbound SYN rate limiting + concurrent connection caps
+  - Optional outbound TCP new-connection rate limiting
   - Outbound ICMP flood protection (rate limited)
   - Rate-limited logging for blocked abuse traffic
   - Kernel sysctl hardening (syncookies, rp_filter, etc.)
@@ -67,6 +76,8 @@ Notes:
   - Full DDoS protection is mostly provider/network-side; this is baseline hardening.
   - "Ban torrent user" at firewall is not reliable for Xray/proxy traffic; best is block BT traffic.
   - If netfilter-persistent exists, avoid running "netfilter-persistent save" while abuse-guard is active.
+  - Generic TCP connection-rate caps are disabled by default because proxy/tunnel workloads can exceed them.
+  - For mixed public nodes, prefer --listeners-file over auto-detect.
 EOF
 }
 
@@ -114,10 +125,29 @@ validate_ports_or_die() {
   done
 }
 
+validate_nonnegative_int_or_die() {
+  local opt_name="$1"
+  local value="${2:-}"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${opt_name} باید عدد صحیح >= 0 باشد"
+}
+
+validate_positive_int_or_die() {
+  local opt_name="$1"
+  local value="${2:-}"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${opt_name} باید عدد صحیح > 0 باشد"
+  (( value > 0 )) || die "${opt_name} باید عدد صحیح > 0 باشد"
+}
+
 AUTO_TCP_PORTS=""
 AUTO_UDP_PORTS=""
 AUTO_PANEL_PORTS=""
 AUTO_DETECT_SOURCES=""
+AUTO_DETECT_FAMILIES=""
+AUTO_ACTIVE_SERVICE_PORTS="0"
+AUTO_DETECT_USED_GENERIC_FALLBACK="0"
+AUTO_SINGLE_SERVICE_FAMILY="0"
+MANIFEST_TCP_PORTS=""
+MANIFEST_UDP_PORTS=""
 
 add_detect_source() {
   local source="${1:-}"
@@ -129,6 +159,19 @@ add_detect_source() {
     AUTO_DETECT_SOURCES="${source}"
   else
     AUTO_DETECT_SOURCES+=",${source}"
+  fi
+}
+
+add_detect_family() {
+  local family="${1:-}"
+  [[ -z "${family}" ]] && return 0
+  case ",${AUTO_DETECT_FAMILIES}," in
+    *",${family},"*) return 0 ;;
+  esac
+  if [[ -z "${AUTO_DETECT_FAMILIES}" ]]; then
+    AUTO_DETECT_FAMILIES="${family}"
+  else
+    AUTO_DETECT_FAMILIES+=",${family}"
   fi
 }
 
@@ -192,14 +235,55 @@ extract_yaml_ports_under_key() {
   ' "${cfg}"
 }
 
+collect_supported_listener_ports() {
+  local proto="${1:-tcp}"
+  local ss_args="-tlnpH"
+  if [[ "${proto}" == "udp" ]]; then
+    ss_args="-ulnpH"
+  fi
+  have_cmd ss || return 0
+  ss ${ss_args} 2>/dev/null | awk '
+    {
+      if ($4 ~ /^127\./ || $4 ~ /^\[::1\]/ || $4 ~ /^localhost:/) next
+      line = tolower($0)
+      family = ""
+      if (line ~ /(^|[^[:alnum:]])xray([^[:alnum:]]|$)/) family = "xray"
+      else if (line ~ /(^|[^[:alnum:]])sing-box([^[:alnum:]]|$)|(^|[^[:alnum:]])singbox([^[:alnum:]]|$)/) family = "sing-box"
+      else if (line ~ /(^|[^[:alnum:]])hysteria([^[:alnum:]]|$)|(^|[^[:alnum:]])hy2([^[:alnum:]]|$)/) family = "hysteria"
+      else if (line ~ /(^|[^[:alnum:]])tuic([^[:alnum:]]|$)/) family = "tuic"
+      else if (line ~ /(^|[^[:alnum:]])ssserver([^[:alnum:]]|$)|(^|[^[:alnum:]])shadowtls([^[:alnum:]]|$)|(^|[^[:alnum:]])outline-ss-server([^[:alnum:]]|$)|(^|[^[:alnum:]])go-shadowsocks2([^[:alnum:]]|$)/) family = "shadowsocks"
+      else if (line ~ /(^|[^[:alnum:]])tor([^[:alnum:]]|$)|(^|[^[:alnum:]])obfs4proxy([^[:alnum:]]|$)|(^|[^[:alnum:]])snowflake([^[:alnum:]]|$)|(^|[^[:alnum:]])webtunnel([^[:alnum:]]|$)/) family = "tor"
+      else if (line ~ /(^|[^[:alnum:]])dnstt([^[:alnum:]]|$)|(^|[^[:alnum:]])dnstm([^[:alnum:]]|$)/) family = "dnstt"
+      else if (line ~ /(^|[^[:alnum:]])slipstream([^[:alnum:]]|$)/) family = "slipstream"
+      else if (line ~ /(^|[^[:alnum:]])haproxy([^[:alnum:]]|$)/) family = "haproxy"
+      if (family == "") next
+
+      port = ""
+      if (match($4, /]:[0-9]+$/)) {
+        port = substr($4, RSTART + 2, RLENGTH - 2)
+      } else if (match($4, /:[0-9]+$/)) {
+        port = substr($4, RSTART + 1, RLENGTH - 1)
+      }
+      if (port ~ /^[0-9]+$/) {
+        print family, port
+      }
+    }
+  ' || true
+}
+
 auto_detect_ports() {
   local allow_ss_fallback="${1:-0}"
   AUTO_TCP_PORTS=""
   AUTO_UDP_PORTS=""
   AUTO_PANEL_PORTS=""
   AUTO_DETECT_SOURCES=""
+  AUTO_DETECT_FAMILIES=""
+  AUTO_ACTIVE_SERVICE_PORTS="0"
+  AUTO_DETECT_USED_GENERIC_FALLBACK="0"
+  AUTO_SINGLE_SERVICE_FAMILY="0"
 
   local cfg db ports ports2 ports3 svc xui_dir
+  local active_tcp_ports="" active_udp_ports="" wg_ports=""
   local found_config_files="0"
 
   # X-UI / 3x-ui panel ports from running process (most reliable)
@@ -353,35 +437,33 @@ auto_detect_ports() {
 
   # WireGuard listen ports
   if have_cmd wg; then
-    ports="$(wg show all listen-port 2>/dev/null | awk '{print $2}' || true)"
-    append_ports_var AUTO_UDP_PORTS "${ports}"
-    [[ -n "${ports}" ]] && add_detect_source "wireguard"
+    wg_ports="$(wg show all listen-port 2>/dev/null | awk '{print $2}' || true)"
+    append_ports_var AUTO_UDP_PORTS "${wg_ports}"
+    if [[ -n "${wg_ports}" ]]; then
+      add_detect_source "wireguard"
+      add_detect_family "wireguard"
+    fi
   fi
 
-  # Active listeners (best-effort): detect ports for relevant processes even if configs/db parsing is incomplete.
+  # Active listeners (preferred): exact TCP/UDP listeners from supported running processes.
   if have_cmd ss; then
-    ports="$(ss -tlnpH 2>/dev/null | awk '
-      $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
-        line=tolower($0)
-        if (line ~ /(xray|paqet|gfk|dangel)/) {
-          if (match($4, /:[0-9]+$/)) {
-            print substr($4, RSTART+1, RLENGTH-1)
-          }
-        }
-      }' || true)"
-    append_ports_var AUTO_TCP_PORTS "${ports}"
-    [[ -n "${ports}" ]] && add_detect_source "ss-procs"
-    ports="$(ss -ulnpH 2>/dev/null | awk '
-      $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
-        line=tolower($0)
-        if (line ~ /(xray|paqet|gfk|dangel)/) {
-          if (match($4, /:[0-9]+$/)) {
-            print substr($4, RSTART+1, RLENGTH-1)
-          }
-        }
-      }' || true)"
-    append_ports_var AUTO_UDP_PORTS "${ports}"
-    [[ -n "${ports}" ]] && add_detect_source "ss-procs"
+    while read -r family port; do
+      [[ -n "${family}" && -n "${port}" ]] || continue
+      append_ports_var active_tcp_ports "${port}"
+      add_detect_family "${family}"
+      AUTO_ACTIVE_SERVICE_PORTS="1"
+    done < <(collect_supported_listener_ports "tcp")
+    while read -r family port; do
+      [[ -n "${family}" && -n "${port}" ]] || continue
+      append_ports_var active_udp_ports "${port}"
+      add_detect_family "${family}"
+      AUTO_ACTIVE_SERVICE_PORTS="1"
+    done < <(collect_supported_listener_ports "udp")
+    if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" ]]; then
+      AUTO_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${active_tcp_ports}")")"
+      AUTO_UDP_PORTS="$(dedup_ports "$(normalize_port_list "${active_udp_ports} ${wg_ports}")")"
+      add_detect_source "ss-active"
+    fi
   fi
 
   # Fallback: active listeners if no known config files and no detected ports
@@ -393,7 +475,10 @@ auto_detect_ports() {
         }
       }' || true)"
     append_ports_var AUTO_TCP_PORTS "${ports}"
-    [[ -n "${ports}" ]] && add_detect_source "ss-fallback"
+    if [[ -n "${ports}" ]]; then
+      add_detect_source "ss-fallback"
+      AUTO_DETECT_USED_GENERIC_FALLBACK="1"
+    fi
     ports="$(ss -ulnpH 2>/dev/null | awk '
       $4 !~ /^127\\./ && $4 !~ /^\\[::1\\]/ {
         if (match($4, /:[0-9]+$/)) {
@@ -401,7 +486,10 @@ auto_detect_ports() {
         }
       }' || true)"
     append_ports_var AUTO_UDP_PORTS "${ports}"
-    [[ -n "${ports}" ]] && add_detect_source "ss-fallback"
+    if [[ -n "${ports}" ]]; then
+      add_detect_source "ss-fallback"
+      AUTO_DETECT_USED_GENERIC_FALLBACK="1"
+    fi
   elif [[ "${found_config_files}" == "0" && -z "${AUTO_TCP_PORTS}" && -z "${AUTO_UDP_PORTS}" && -z "${AUTO_PANEL_PORTS}" ]] && have_cmd ss; then
     log "WARNING: no config/db ports detected and ss-fallback is disabled; use manual ports or --allow-ss-fallback."
   fi
@@ -409,6 +497,9 @@ auto_detect_ports() {
   AUTO_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_TCP_PORTS}")")"
   AUTO_UDP_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_UDP_PORTS}")")"
   AUTO_PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${AUTO_PANEL_PORTS}")")"
+  if [[ -n "${AUTO_DETECT_FAMILIES}" ]] && [[ "$(wc -w <<<"${AUTO_DETECT_FAMILIES}" | tr -d ' ')" == "1" ]]; then
+    AUTO_SINGLE_SERVICE_FAMILY="1"
+  fi
 }
 
 ports_for_nft() {
@@ -449,25 +540,45 @@ config_dir="/etc/abuse-guard"
 config_file="${config_dir}/config.env"
 sysctl_file="/etc/sysctl.d/99-abuse-guard.conf"
 nft_file="${config_dir}/abuse-guard.nft"
+default_listeners_example="${config_dir}/listeners.example.conf"
+installed_listeners_manifest="${config_dir}/listeners.conf"
 systemd_unit="/etc/systemd/system/abuse-guard.service"
 refresh_service_unit="/etc/systemd/system/abuse-guard-refresh.service"
 refresh_timer_unit="/etc/systemd/system/abuse-guard-refresh.timer"
 installed_bin="/usr/local/sbin/abuse-guard"
 script_raw_url="https://raw.githubusercontent.com/changecoin938/abuse-xray/main/abuse-guard.sh"
 PIPE_SCRIPT_CACHE=""
+LISTENERS_FILE=""
+ALLOW_UNSAFE_LOCKDOWN_AUTO=""
+AUTO_ALLOW_PANELS=""
+EFFECTIVE_SSH_PORT=""
+EFFECTIVE_XRAY_PORTS=""
+EFFECTIVE_PANEL_PORTS=""
+EFFECTIVE_ALLOW_IN_TCP=""
+EFFECTIVE_ALLOW_IN_UDP=""
+LEGACY_MERGED_PORT_CONFIG="0"
 
 write_config() {
   local backend="$1"
   local lockdown="$2"
   local ssh_port="$3"
-  local xray_ports="$4"
-  local panel_ports="$5"
-  local allow_in_tcp="$6"
-  local allow_in_udp="$7"
-  local apply_sysctl="$8"
-  local auto_detect="$9"
-  local allow_ss_fallback="${10}"
-  local refresh_interval="${11}"
+  local ssh_port_source="$4"
+  local listeners_file="$5"
+  local xray_ports="$6"
+  local panel_ports="$7"
+  local allow_in_tcp="$8"
+  local allow_in_udp="$9"
+  local apply_sysctl="${10}"
+  local auto_detect="${11}"
+  local auto_allow_panels="${12}"
+  local allow_ss_fallback="${13}"
+  local allow_unsafe_lockdown_auto="${14}"
+  local refresh_interval="${15}"
+  local inbound_syn_rate="${16}"
+  local inbound_syn_burst="${17}"
+  local per_ip_conn_cap="${18}"
+  local outbound_syn_rate="${19}"
+  local outbound_syn_burst="${20}"
   local old_umask
 
   mkdir -p "${config_dir}"
@@ -477,14 +588,27 @@ write_config() {
 BACKEND="${backend}"
 LOCKDOWN="${lockdown}"
 SSH_PORT="${ssh_port}"
+SSH_PORT_SOURCE="${ssh_port_source}"
+LISTENERS_FILE="${listeners_file}"
 XRAY_PORTS="${xray_ports}"
 PANEL_PORTS="${panel_ports}"
 ALLOW_IN_TCP="${allow_in_tcp}"
 ALLOW_IN_UDP="${allow_in_udp}"
+MANUAL_XRAY_PORTS="${xray_ports}"
+MANUAL_PANEL_PORTS="${panel_ports}"
+MANUAL_ALLOW_IN_TCP="${allow_in_tcp}"
+MANUAL_ALLOW_IN_UDP="${allow_in_udp}"
 APPLY_SYSCTL="${apply_sysctl}"
 AUTO_DETECT="${auto_detect}"
+AUTO_ALLOW_PANELS="${auto_allow_panels}"
 ALLOW_SS_FALLBACK="${allow_ss_fallback}"
+ALLOW_UNSAFE_LOCKDOWN_AUTO="${allow_unsafe_lockdown_auto}"
 REFRESH_INTERVAL="${refresh_interval}"
+INBOUND_SYN_RATE="${inbound_syn_rate}"
+INBOUND_SYN_BURST="${inbound_syn_burst}"
+PER_IP_CONN_CAP="${per_ip_conn_cap}"
+OUTBOUND_SYN_RATE="${outbound_syn_rate}"
+OUTBOUND_SYN_BURST="${outbound_syn_burst}"
 EOF
   chmod 0644 "${config_file}"
   umask "${old_umask}"
@@ -497,6 +621,51 @@ trim_ws() {
   printf '%s' "${value}"
 }
 
+load_listeners_manifest() {
+  local listeners_file="${1:-}"
+  local line raw proto ports ignored line_no="0"
+
+  MANIFEST_TCP_PORTS=""
+  MANIFEST_UDP_PORTS=""
+  [[ -z "${listeners_file}" ]] && return 0
+  [[ -r "${listeners_file}" ]] || die "listeners file not readable: ${listeners_file}"
+
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    line_no=$((line_no + 1))
+    line="${raw%%#*}"
+    line="$(trim_ws "${line}")"
+    [[ -z "${line}" ]] && continue
+    read -r proto ports ignored <<<"${line}"
+    [[ -n "${proto}" && -n "${ports}" ]] || die "listeners file syntax error at ${listeners_file}:${line_no}"
+
+    case "${proto}" in
+      tcp)
+        validate_ports_or_die "$(normalize_port_list "${ports}")"
+        append_ports_var MANIFEST_TCP_PORTS "$(normalize_port_list "${ports}")"
+        ;;
+      udp)
+        validate_ports_or_die "$(normalize_port_list "${ports}")"
+        append_ports_var MANIFEST_UDP_PORTS "$(normalize_port_list "${ports}")"
+        ;;
+      both|tcp+udp|udp+tcp)
+        validate_ports_or_die "$(normalize_port_list "${ports}")"
+        append_ports_var MANIFEST_TCP_PORTS "$(normalize_port_list "${ports}")"
+        append_ports_var MANIFEST_UDP_PORTS "$(normalize_port_list "${ports}")"
+        ;;
+      *)
+        die "listeners file protocol must be tcp/udp/both at ${listeners_file}:${line_no}"
+        ;;
+    esac
+  done < "${listeners_file}"
+
+  MANIFEST_TCP_PORTS="$(dedup_ports "$(normalize_port_list "${MANIFEST_TCP_PORTS}")")"
+  MANIFEST_UDP_PORTS="$(dedup_ports "$(normalize_port_list "${MANIFEST_UDP_PORTS}")")"
+}
+
+has_explicit_listener_config() {
+  [[ -n "${LISTENERS_FILE}" || -n "${MANUAL_XRAY_PORTS}" || -n "${MANUAL_PANEL_PORTS}" || -n "${MANUAL_ALLOW_IN_TCP}" || -n "${MANUAL_ALLOW_IN_UDP}" ]]
+}
+
 read_config() {
   local strict="${1:-1}"
   if [[ ! -r "${config_file}" ]]; then
@@ -507,14 +676,28 @@ read_config() {
   BACKEND=""
   LOCKDOWN=""
   SSH_PORT=""
+  SSH_PORT_SOURCE=""
+  LISTENERS_FILE=""
   XRAY_PORTS=""
   PANEL_PORTS=""
   ALLOW_IN_TCP=""
   ALLOW_IN_UDP=""
+  MANUAL_XRAY_PORTS=""
+  MANUAL_PANEL_PORTS=""
+  MANUAL_ALLOW_IN_TCP=""
+  MANUAL_ALLOW_IN_UDP=""
   APPLY_SYSCTL=""
   AUTO_DETECT=""
+  AUTO_ALLOW_PANELS=""
   ALLOW_SS_FALLBACK=""
+  ALLOW_UNSAFE_LOCKDOWN_AUTO=""
   REFRESH_INTERVAL=""
+  INBOUND_SYN_RATE=""
+  INBOUND_SYN_BURST=""
+  PER_IP_CONN_CAP=""
+  OUTBOUND_SYN_RATE=""
+  OUTBOUND_SYN_BURST=""
+  LEGACY_MERGED_PORT_CONFIG="0"
 
   local key val line
   while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -538,14 +721,27 @@ read_config() {
       BACKEND) BACKEND="${val}" ;;
       LOCKDOWN) LOCKDOWN="${val}" ;;
       SSH_PORT) SSH_PORT="${val}" ;;
+      SSH_PORT_SOURCE) SSH_PORT_SOURCE="${val}" ;;
+      LISTENERS_FILE) LISTENERS_FILE="${val}" ;;
       XRAY_PORTS) XRAY_PORTS="${val}" ;;
       PANEL_PORTS) PANEL_PORTS="${val}" ;;
       ALLOW_IN_TCP) ALLOW_IN_TCP="${val}" ;;
       ALLOW_IN_UDP) ALLOW_IN_UDP="${val}" ;;
+      MANUAL_XRAY_PORTS) MANUAL_XRAY_PORTS="${val}" ;;
+      MANUAL_PANEL_PORTS) MANUAL_PANEL_PORTS="${val}" ;;
+      MANUAL_ALLOW_IN_TCP) MANUAL_ALLOW_IN_TCP="${val}" ;;
+      MANUAL_ALLOW_IN_UDP) MANUAL_ALLOW_IN_UDP="${val}" ;;
       APPLY_SYSCTL) APPLY_SYSCTL="${val}" ;;
       AUTO_DETECT) AUTO_DETECT="${val}" ;;
+      AUTO_ALLOW_PANELS) AUTO_ALLOW_PANELS="${val}" ;;
       ALLOW_SS_FALLBACK) ALLOW_SS_FALLBACK="${val}" ;;
+      ALLOW_UNSAFE_LOCKDOWN_AUTO) ALLOW_UNSAFE_LOCKDOWN_AUTO="${val}" ;;
       REFRESH_INTERVAL) REFRESH_INTERVAL="${val}" ;;
+      INBOUND_SYN_RATE) INBOUND_SYN_RATE="${val}" ;;
+      INBOUND_SYN_BURST) INBOUND_SYN_BURST="${val}" ;;
+      PER_IP_CONN_CAP) PER_IP_CONN_CAP="${val}" ;;
+      OUTBOUND_SYN_RATE) OUTBOUND_SYN_RATE="${val}" ;;
+      OUTBOUND_SYN_BURST) OUTBOUND_SYN_BURST="${val}" ;;
     esac
   done < "${config_file}"
 
@@ -558,14 +754,68 @@ read_config() {
   : "${PANEL_PORTS:=}"
   : "${ALLOW_IN_TCP:=}"
   : "${ALLOW_IN_UDP:=}"
+  if [[ -z "${MANUAL_XRAY_PORTS}" && -z "${MANUAL_PANEL_PORTS}" && -z "${MANUAL_ALLOW_IN_TCP}" && -z "${MANUAL_ALLOW_IN_UDP}" ]] && \
+     [[ -n "${XRAY_PORTS}" || -n "${PANEL_PORTS}" || -n "${ALLOW_IN_TCP}" || -n "${ALLOW_IN_UDP}" ]]; then
+    LEGACY_MERGED_PORT_CONFIG="1"
+  fi
+  : "${SSH_PORT_SOURCE:=manual}"
+  : "${MANUAL_XRAY_PORTS:=${XRAY_PORTS}}"
+  : "${MANUAL_PANEL_PORTS:=${PANEL_PORTS}}"
+  : "${MANUAL_ALLOW_IN_TCP:=${ALLOW_IN_TCP}}"
+  : "${MANUAL_ALLOW_IN_UDP:=${ALLOW_IN_UDP}}"
   : "${APPLY_SYSCTL:=1}"
   : "${AUTO_DETECT:=1}"
+  : "${AUTO_ALLOW_PANELS:=0}"
   : "${ALLOW_SS_FALLBACK:=0}"
+  : "${ALLOW_UNSAFE_LOCKDOWN_AUTO:=0}"
   : "${REFRESH_INTERVAL:=300}"
+  : "${INBOUND_SYN_RATE:=0}"
+  : "${INBOUND_SYN_BURST:=40}"
+  : "${PER_IP_CONN_CAP:=0}"
+  : "${OUTBOUND_SYN_RATE:=0}"
+  : "${OUTBOUND_SYN_BURST:=100}"
 }
 
 read_config_or_die() {
   read_config "1"
+}
+
+refresh_runtime_ports() {
+  EFFECTIVE_SSH_PORT="$(dedup_ports "$(normalize_port_list "${SSH_PORT}")")"
+  if [[ "${SSH_PORT_SOURCE}" == "auto" ]]; then
+    local detected_ssh=""
+    detected_ssh="$(detect_ssh_port)"
+    if [[ -n "${detected_ssh}" ]]; then
+      EFFECTIVE_SSH_PORT="$(dedup_ports "$(normalize_port_list "${detected_ssh}")")"
+    fi
+  fi
+
+  EFFECTIVE_XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${MANUAL_XRAY_PORTS}")")"
+  EFFECTIVE_PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${MANUAL_PANEL_PORTS}")")"
+  EFFECTIVE_ALLOW_IN_TCP="$(dedup_ports "$(normalize_port_list "${MANUAL_ALLOW_IN_TCP}")")"
+  EFFECTIVE_ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${MANUAL_ALLOW_IN_UDP}")")"
+  load_listeners_manifest "${LISTENERS_FILE}"
+  EFFECTIVE_ALLOW_IN_TCP="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_ALLOW_IN_TCP} ${MANIFEST_TCP_PORTS}")")"
+  EFFECTIVE_ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_ALLOW_IN_UDP} ${MANIFEST_UDP_PORTS}")")"
+
+  if [[ "${AUTO_DETECT}" == "1" ]]; then
+    auto_detect_ports "${ALLOW_SS_FALLBACK}"
+    EFFECTIVE_XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_XRAY_PORTS} ${AUTO_TCP_PORTS}")")"
+    if [[ "${AUTO_ALLOW_PANELS}" == "1" ]]; then
+      EFFECTIVE_PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_PANEL_PORTS} ${AUTO_PANEL_PORTS}")")"
+    fi
+    EFFECTIVE_ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${EFFECTIVE_ALLOW_IN_UDP} ${AUTO_UDP_PORTS}")")"
+  else
+    AUTO_TCP_PORTS=""
+    AUTO_UDP_PORTS=""
+    AUTO_PANEL_PORTS=""
+  fi
+
+  validate_ports_or_die "$(normalize_port_list "${EFFECTIVE_SSH_PORT}")"
+  validate_ports_or_die "${EFFECTIVE_XRAY_PORTS}"
+  validate_ports_or_die "${EFFECTIVE_PANEL_PORTS}"
+  validate_ports_or_die "${EFFECTIVE_ALLOW_IN_TCP}"
+  validate_ports_or_die "${EFFECTIVE_ALLOW_IN_UDP}"
 }
 
 detect_running_script_source() {
@@ -623,6 +873,48 @@ install_self() {
   fi
 }
 
+write_listeners_example() {
+  mkdir -p "${config_dir}"
+  if [[ -e "${default_listeners_example}" ]]; then
+    return 0
+  fi
+  cat >"${default_listeners_example}" <<'EOF'
+# Explicit listeners manifest for mixed public nodes.
+# Format:
+#   tcp  443        xray-vless-tls
+#   udp  51820      wireguard
+#   both 8443       hysteria2-or-tuic
+#
+# Notes:
+# - First column: tcp / udp / both
+# - Second column: single port, comma list, or range
+# - Third column is optional and ignored by the script; use it as a label
+#
+# Examples:
+# tcp 22 ssh
+# tcp 443 xray-shared
+# tcp 2053 trojan
+# udp 51820 wireguard
+# both 8443 hysteria2
+EOF
+  chmod 0644 "${default_listeners_example}"
+}
+
+install_listeners_manifest() {
+  local src="${1:-}"
+  if [[ -z "${src}" ]]; then
+    rm -f "${installed_listeners_manifest}"
+    return 0
+  fi
+  [[ -r "${src}" ]] || die "listeners file not readable: ${src}"
+  mkdir -p "${config_dir}"
+  if [[ "${src}" != "${installed_listeners_manifest}" ]]; then
+    cat "${src}" > "${installed_listeners_manifest}"
+    chmod 0644 "${installed_listeners_manifest}"
+  fi
+  printf '%s\n' "${installed_listeners_manifest}"
+}
+
 apply_sysctl_hardening() {
   cat >"${sysctl_file}" <<'EOF'
 # Managed by abuse-guard (baseline hardening)
@@ -639,7 +931,8 @@ net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.tcp_rfc1337 = 1
-net.netfilter.nf_conntrack_max = 262144
+# nf_conntrack_max is intentionally not hard-coded here; the kernel default
+# scales from available memory and busy proxy/tunnel servers vary widely.
 net.netfilter.nf_conntrack_udp_timeout = 60
 net.netfilter.nf_conntrack_udp_timeout_stream = 180
 net.ipv6.conf.all.accept_redirects = 0
@@ -672,9 +965,16 @@ nft_write_rules() {
   local allow_in_tcp_list="$4"
   local allow_in_udp_list="$5"
   local lockdown="$6"
+  local inbound_syn_rate="$7"
+  local inbound_syn_burst="$8"
+  local per_ip_conn_cap="$9"
+  local outbound_syn_rate="${10}"
+  local outbound_syn_burst="${11}"
 
   local allowed_tcp allowed_udp
   local tcp_list udp_list
+  local inbound_protection_rules=""
+  local outbound_protection_rules=""
 
   tcp_list="$(ports_for_nft "$(normalize_port_list "${ssh_port} ${panel_ports_list} ${xray_ports_list} ${allow_in_tcp_list}")")"
   udp_list="$(ports_for_nft "$(normalize_port_list "${xray_ports_list} ${allow_in_udp_list}")")"
@@ -684,6 +984,22 @@ nft_write_rules() {
 
   allowed_tcp="$(nft_render_set_elems "${tcp_list}")"
   allowed_udp="$(nft_render_set_elems "${udp_list}")"
+
+  if (( inbound_syn_rate > 0 )); then
+    inbound_protection_rules+=$'    # Inbound SYN rate limiting (per source IP on managed TCP ports)\n'
+    inbound_protection_rules+="    tcp dport @allowed_tcp_in tcp flags syn meter per_ip_syn_v4 { ip saddr limit rate over ${inbound_syn_rate}/second burst ${inbound_syn_burst} packets } drop"$'\n'
+    inbound_protection_rules+="    tcp dport @allowed_tcp_in tcp flags syn meter per_ip_syn_v6 { ip6 saddr limit rate over ${inbound_syn_rate}/second burst ${inbound_syn_burst} packets } drop"$'\n'
+  fi
+  if (( per_ip_conn_cap > 0 )); then
+    inbound_protection_rules+=$'    # Per-source concurrent connection cap on managed TCP ports\n'
+    inbound_protection_rules+="    tcp dport @allowed_tcp_in meter per_ip_conns_v4 { ip saddr ct count over ${per_ip_conn_cap} } drop"$'\n'
+    inbound_protection_rules+="    tcp dport @allowed_tcp_in meter per_ip_conns_v6 { ip6 saddr ct count over ${per_ip_conn_cap} } drop"$'\n'
+  fi
+  if (( outbound_syn_rate > 0 )); then
+    outbound_protection_rules+=$'    # Outbound new TCP connection rate limiting (per destination; tune carefully for proxy/tunnel workloads)\n'
+    outbound_protection_rules+="    tcp flags syn meter out_syn_v4 { ip daddr limit rate over ${outbound_syn_rate}/second burst ${outbound_syn_burst} packets } drop"$'\n'
+    outbound_protection_rules+="    tcp flags syn meter out_syn_v6 { ip6 daddr limit rate over ${outbound_syn_rate}/second burst ${outbound_syn_burst} packets } drop"$'\n'
+  fi
 
   mkdir -p "${config_dir}"
   cat >"${nft_file}" <<EOF
@@ -715,10 +1031,7 @@ table inet abuse_guard {
     ip6 nexthdr ipv6-icmp limit rate 10/second burst 20 packets accept
     ip6 nexthdr ipv6-icmp drop
 
-    # Inbound SYN flood / connection abuse control
-    tcp flags syn limit rate over 20/second burst 40 packets drop
-    tcp dport @allowed_tcp_in meter per_ip_conns_v4 { ip saddr ct count over 100 } drop
-    tcp dport @allowed_tcp_in meter per_ip_conns_v6 { ip6 saddr ct count over 100 } drop
+${inbound_protection_rules}
 
     tcp dport @allowed_tcp_in accept
     udp dport @allowed_udp_in accept
@@ -728,8 +1041,7 @@ table inet abuse_guard {
     type filter hook output priority -150;
     policy accept;
 
-    # Outbound new TCP connection rate limiting
-    tcp flags syn limit rate over 50/second burst 100 packets drop
+${outbound_protection_rules}
 
     # Block outbound email spam (SMTP/SMTPS/Submission)
     tcp dport { 25, 465, 587 } limit rate 5/minute log prefix "abuse-guard-smtp: " level warn
@@ -859,6 +1171,11 @@ iptables_apply_family() {
   local allow_in_tcp_list="$5"
   local allow_in_udp_list="$6"
   local lockdown="$7"
+  local inbound_syn_rate="$8"
+  local inbound_syn_burst="$9"
+  local per_ip_conn_cap="${10}"
+  local outbound_syn_rate="${11}"
+  local outbound_syn_burst="${12}"
 
   local tcp_list udp_list
   tcp_list="$(ports_for_iptables "$(normalize_port_list "${ssh_port} ${panel_ports_list} ${xray_ports_list} ${allow_in_tcp_list}")")"
@@ -902,21 +1219,21 @@ iptables_apply_family() {
   "${ipt}" -A "${iptables_chain_name_in}" -p "${icmp_proto}" -m limit --limit 10/sec --limit-burst 20 -j ACCEPT
   "${ipt}" -A "${iptables_chain_name_in}" -p "${icmp_proto}" -j DROP
 
-  # Inbound SYN rate limiting + per-IP concurrent connection cap
-  if [[ "${has_hashlimit}" == "1" ]]; then
-    "${ipt}" -A "${iptables_chain_name_in}" -p tcp --syn -m hashlimit \
-      --hashlimit-above 20/sec --hashlimit-burst 40 \
-      --hashlimit-mode srcip --hashlimit-name "abg_in_syn_${family}" \
-      -j DROP
-  fi
-  if [[ "${has_connlimit}" == "1" ]]; then
-    "${ipt}" -A "${iptables_chain_name_in}" -p tcp --syn -m connlimit \
-      --connlimit-above 100 --connlimit-mask "${connlimit_mask}" \
-      -j DROP
-  fi
-
   local p
   for p in ${tcp_list}; do
+    local hashlimit_name=""
+    hashlimit_name="abg_in_${family}_$(echo "${p}" | tr ':' '_' | tr -cd '[:alnum:]_')"
+    if [[ "${has_hashlimit}" == "1" && "${inbound_syn_rate}" != "0" ]]; then
+      "${ipt}" -A "${iptables_chain_name_in}" -p tcp --dport "${p}" --syn -m hashlimit \
+        --hashlimit-above "${inbound_syn_rate}/sec" --hashlimit-burst "${inbound_syn_burst}" \
+        --hashlimit-mode srcip --hashlimit-name "${hashlimit_name}" \
+        -j DROP
+    fi
+    if [[ "${has_connlimit}" == "1" && "${per_ip_conn_cap}" != "0" ]]; then
+      "${ipt}" -A "${iptables_chain_name_in}" -p tcp --dport "${p}" --syn -m connlimit \
+        --connlimit-above "${per_ip_conn_cap}" --connlimit-mask "${connlimit_mask}" \
+        -j DROP
+    fi
     "${ipt}" -A "${iptables_chain_name_in}" -p tcp --dport "${p}" -j ACCEPT
   done
   for p in ${udp_list}; do
@@ -930,10 +1247,10 @@ iptables_apply_family() {
   fi
 
   # OUTPUT blocks + logging
-  if [[ "${has_hashlimit}" == "1" ]]; then
+  if [[ "${has_hashlimit}" == "1" && "${outbound_syn_rate}" != "0" ]]; then
     "${ipt}" -A "${iptables_chain_name_out}" -p tcp --syn -m hashlimit \
-      --hashlimit-above 50/sec --hashlimit-burst 100 \
-      --hashlimit-mode srcip --hashlimit-name "abg_out_syn_${family}" \
+      --hashlimit-above "${outbound_syn_rate}/sec" --hashlimit-burst "${outbound_syn_burst}" \
+      --hashlimit-mode dstip --hashlimit-name "abg_out_syn_${family}" \
       -j DROP
   fi
 
@@ -1104,13 +1421,23 @@ cmd_install() {
   local backend="auto"
   local lockdown="0"
   local ssh_port=""
+  local ssh_port_source="manual"
+  local listeners_file=""
   local xray_ports=""
   local panel_ports=""
   local allow_in_tcp=""
   local allow_in_udp=""
   local apply_sysctl="1"
   local auto_detect="1"
+  local merge_auto_detect="0"
+  local auto_allow_panels="0"
   local allow_ss_fallback="0"
+  local allow_unsafe_lockdown_auto="0"
+  local inbound_syn_rate="0"
+  local inbound_syn_burst="40"
+  local per_ip_conn_cap="0"
+  local outbound_syn_rate="0"
+  local outbound_syn_burst="100"
   local refresh_interval="300"
   local force="0"
 
@@ -1122,6 +1449,8 @@ cmd_install() {
         lockdown="1"; shift ;;
       --ssh-port)
         ssh_port="${2:-}"; shift 2 ;;
+      --listeners-file)
+        listeners_file="${2:-}"; shift 2 ;;
       --xray-ports)
         xray_ports="${2:-}"; shift 2 ;;
       --panel-ports)
@@ -1132,8 +1461,24 @@ cmd_install() {
         allow_in_udp="${2:-}"; shift 2 ;;
       --no-auto-detect)
         auto_detect="0"; shift ;;
+      --merge-auto-detect)
+        merge_auto_detect="1"; shift ;;
+      --auto-allow-panels)
+        auto_allow_panels="1"; shift ;;
       --allow-ss-fallback)
         allow_ss_fallback="1"; shift ;;
+      --allow-unsafe-lockdown-auto)
+        allow_unsafe_lockdown_auto="1"; shift ;;
+      --in-syn-rate)
+        inbound_syn_rate="${2:-}"; shift 2 ;;
+      --in-syn-burst)
+        inbound_syn_burst="${2:-}"; shift 2 ;;
+      --per-ip-conn-cap)
+        per_ip_conn_cap="${2:-}"; shift 2 ;;
+      --out-syn-rate)
+        outbound_syn_rate="${2:-}"; shift 2 ;;
+      --out-syn-burst)
+        outbound_syn_burst="${2:-}"; shift 2 ;;
       --refresh-interval)
         refresh_interval="${2:-}"; shift 2 ;;
       --force)
@@ -1149,19 +1494,35 @@ cmd_install() {
 
   if [[ -z "${ssh_port}" ]]; then
     ssh_port="$(detect_ssh_port)"
+    ssh_port_source="auto"
   fi
   [[ "${refresh_interval}" =~ ^[0-9]+$ ]] || die "--refresh-interval باید عدد صحیح >= 0 باشد"
+  validate_nonnegative_int_or_die "--in-syn-rate" "${inbound_syn_rate}"
+  validate_nonnegative_int_or_die "--in-syn-burst" "${inbound_syn_burst}"
+  validate_nonnegative_int_or_die "--per-ip-conn-cap" "${per_ip_conn_cap}"
+  validate_nonnegative_int_or_die "--out-syn-rate" "${outbound_syn_rate}"
+  validate_nonnegative_int_or_die "--out-syn-burst" "${outbound_syn_burst}"
+  if (( inbound_syn_rate > 0 )); then
+    validate_positive_int_or_die "--in-syn-burst" "${inbound_syn_burst}"
+  fi
+  if (( outbound_syn_rate > 0 )); then
+    validate_positive_int_or_die "--out-syn-burst" "${outbound_syn_burst}"
+  fi
+  if [[ -n "${listeners_file}" && "${auto_detect}" == "1" && "${merge_auto_detect}" != "1" ]]; then
+    log "listeners file provided; disabling auto-detect to avoid opening guessed ports."
+    auto_detect="0"
+  fi
 
   if [[ "${auto_detect}" == "1" ]]; then
     log "Auto-detecting tunnel/xray/panel ports..."
     auto_detect_ports "${allow_ss_fallback}"
-    xray_ports="$(normalize_port_list "${xray_ports} ${AUTO_TCP_PORTS}")"
-    panel_ports="$(normalize_port_list "${panel_ports} ${AUTO_PANEL_PORTS}")"
-    allow_in_udp="$(normalize_port_list "${allow_in_udp} ${AUTO_UDP_PORTS}")"
     if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_PANEL_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
       log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
       log "Auto-detected Panel: ${AUTO_PANEL_PORTS:-none}"
       log "Auto-detected UDP: ${AUTO_UDP_PORTS:-none}"
+      if [[ -n "${AUTO_PANEL_PORTS}" && "${auto_allow_panels}" != "1" ]]; then
+        log "Detected public panel ports will not be auto-allowed unless --auto-allow-panels is set."
+      fi
       [[ -n "${AUTO_DETECT_SOURCES}" ]] && log "Auto-detect sources: ${AUTO_DETECT_SOURCES}"
     else
       log "Warning: no ports auto-detected. Use --xray-ports and --panel-ports manually."
@@ -1178,6 +1539,19 @@ cmd_install() {
   validate_ports_or_die "${panel_ports}"
   validate_ports_or_die "${allow_in_tcp}"
   validate_ports_or_die "${allow_in_udp}"
+  if [[ "${lockdown}" == "1" && "${auto_detect}" == "1" && -z "${listeners_file}" && -z "${xray_ports}" && -z "${panel_ports}" && -z "${allow_in_tcp}" && -z "${allow_in_udp}" && "${allow_unsafe_lockdown_auto}" != "1" ]]; then
+    if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" && "${AUTO_DETECT_USED_GENERIC_FALLBACK}" != "1" && "${AUTO_SINGLE_SERVICE_FAMILY}" == "1" ]]; then
+      log "Using active listener auto-detect for single-service node: ${AUTO_DETECT_FAMILIES:-unknown}"
+    else
+      die "برای lockdown بدون پورت دستی/manifest باید دقیقاً یک family سرویس عمومیِ در حال listen داشته باشی تا auto-detect قابل اعتماد باشد. در غیر این صورت از --listeners-file یا پورت‌های دستی استفاده کن."
+    fi
+  fi
+  if [[ -n "${listeners_file}" ]]; then
+    load_listeners_manifest "${listeners_file}"
+    listeners_file="$(install_listeners_manifest "${listeners_file}")"
+  else
+    install_listeners_manifest ""
+  fi
 
   if [[ "${backend}" == "auto" ]]; then
     backend="$(backend_auto)"
@@ -1206,8 +1580,9 @@ cmd_install() {
     log "WARNING: run 'abuse-guard uninstall' before persisting firewall state."
   fi
 
-  write_config "${backend}" "${lockdown}" "${ssh_port}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${allow_ss_fallback}" "${refresh_interval}"
+  write_config "${backend}" "${lockdown}" "${ssh_port}" "${ssh_port_source}" "${listeners_file}" "${xray_ports}" "${panel_ports}" "${allow_in_tcp}" "${allow_in_udp}" "${apply_sysctl}" "${auto_detect}" "${auto_allow_panels}" "${allow_ss_fallback}" "${allow_unsafe_lockdown_auto}" "${refresh_interval}" "${inbound_syn_rate}" "${inbound_syn_burst}" "${per_ip_conn_cap}" "${outbound_syn_rate}" "${outbound_syn_burst}"
   install_self
+  write_listeners_example
 
   if [[ "${apply_sysctl}" == "1" ]]; then
     apply_sysctl_hardening
@@ -1222,19 +1597,48 @@ cmd_install() {
   log "نصب شد. وضعیت:"
   "${installed_bin}" status || true
   if [[ "${lockdown}" == "1" ]]; then
-    log "lockdown فعال است: فقط SSH + پورت‌های Xray/Panel باز هستند."
+    log "lockdown فعال است: فقط SSH + پورت‌های صریح/مجاز باز هستند."
   else
     log "lockdown غیرفعال است: فقط بلاک‌های خروجی و hygiene ورودی اعمال شده."
+  fi
+  if [[ -n "${listeners_file}" ]]; then
+    log "listeners file installed at: ${listeners_file}"
+  fi
+  if [[ -e "${default_listeners_example}" ]]; then
+    log "listeners manifest example: ${default_listeners_example}"
   fi
 }
 
 cmd_apply() {
   need_root
   read_config_or_die
+  validate_nonnegative_int_or_die "INBOUND_SYN_RATE" "${INBOUND_SYN_RATE}"
+  validate_nonnegative_int_or_die "INBOUND_SYN_BURST" "${INBOUND_SYN_BURST}"
+  validate_nonnegative_int_or_die "PER_IP_CONN_CAP" "${PER_IP_CONN_CAP}"
+  validate_nonnegative_int_or_die "OUTBOUND_SYN_RATE" "${OUTBOUND_SYN_RATE}"
+  validate_nonnegative_int_or_die "OUTBOUND_SYN_BURST" "${OUTBOUND_SYN_BURST}"
+  if (( INBOUND_SYN_RATE > 0 )); then
+    validate_positive_int_or_die "INBOUND_SYN_BURST" "${INBOUND_SYN_BURST}"
+  fi
+  if (( OUTBOUND_SYN_RATE > 0 )); then
+    validate_positive_int_or_die "OUTBOUND_SYN_BURST" "${OUTBOUND_SYN_BURST}"
+  fi
   write_refresh_units "${REFRESH_INTERVAL}"
+  refresh_runtime_ports
+  if [[ "${LOCKDOWN}" == "1" && "${AUTO_DETECT}" == "1" ]] && ! has_explicit_listener_config && [[ "${ALLOW_UNSAFE_LOCKDOWN_AUTO}" != "1" ]]; then
+    if [[ "${AUTO_ACTIVE_SERVICE_PORTS}" == "1" && "${AUTO_DETECT_USED_GENERIC_FALLBACK}" != "1" && "${AUTO_SINGLE_SERVICE_FAMILY}" == "1" ]]; then
+      log "Using active listener auto-detect for single-service node: ${AUTO_DETECT_FAMILIES:-unknown}"
+    else
+      log "WARNING: lockdown is running without explicit ports and without trusted single-service active-listener detection."
+      log "WARNING: for this server, use LISTENERS_FILE or explicit manual ports."
+    fi
+  fi
+  if [[ "${AUTO_DETECT}" == "1" && "${LEGACY_MERGED_PORT_CONFIG}" == "1" ]]; then
+    log "WARNING: legacy config detected; previously auto-detected ports may still be persisted in config."
+    log "WARNING: reinstall or rewrite /etc/abuse-guard/config.env to fully separate manual ports from auto-detected ports."
+  fi
 
   if [[ "${AUTO_DETECT}" == "1" ]]; then
-    auto_detect_ports "${ALLOW_SS_FALLBACK}"
     if [[ -n "${AUTO_TCP_PORTS}" || -n "${AUTO_PANEL_PORTS}" || -n "${AUTO_UDP_PORTS}" ]]; then
       log "Auto-detected TCP: ${AUTO_TCP_PORTS:-none}"
       log "Auto-detected Panel: ${AUTO_PANEL_PORTS:-none}"
@@ -1243,25 +1647,7 @@ cmd_apply() {
     else
       log "Warning: no ports auto-detected. Use --xray-ports and --panel-ports manually."
     fi
-    XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${XRAY_PORTS} ${AUTO_TCP_PORTS}")")"
-    PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${PANEL_PORTS} ${AUTO_PANEL_PORTS}")")"
-    ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${ALLOW_IN_UDP} ${AUTO_UDP_PORTS}")")"
-  else
-    AUTO_TCP_PORTS=""
-    AUTO_UDP_PORTS=""
-    AUTO_PANEL_PORTS=""
   fi
-
-  XRAY_PORTS="$(dedup_ports "$(normalize_port_list "${XRAY_PORTS}")")"
-  PANEL_PORTS="$(dedup_ports "$(normalize_port_list "${PANEL_PORTS}")")"
-  ALLOW_IN_TCP="$(dedup_ports "$(normalize_port_list "${ALLOW_IN_TCP}")")"
-  ALLOW_IN_UDP="$(dedup_ports "$(normalize_port_list "${ALLOW_IN_UDP}")")"
-
-  validate_ports_or_die "$(normalize_port_list "${SSH_PORT}")"
-  validate_ports_or_die "${XRAY_PORTS}"
-  validate_ports_or_die "${PANEL_PORTS}"
-  validate_ports_or_die "${ALLOW_IN_TCP}"
-  validate_ports_or_die "${ALLOW_IN_UDP}"
 
   if [[ "${APPLY_SYSCTL}" == "1" ]]; then
     apply_sysctl_hardening
@@ -1269,12 +1655,12 @@ cmd_apply() {
 
   case "${BACKEND}" in
     nft)
-      nft_write_rules "${SSH_PORT}" "${XRAY_PORTS}" "${PANEL_PORTS}" "${ALLOW_IN_TCP}" "${ALLOW_IN_UDP}" "${LOCKDOWN}"
+      nft_write_rules "${EFFECTIVE_SSH_PORT}" "${EFFECTIVE_XRAY_PORTS}" "${EFFECTIVE_PANEL_PORTS}" "${EFFECTIVE_ALLOW_IN_TCP}" "${EFFECTIVE_ALLOW_IN_UDP}" "${LOCKDOWN}" "${INBOUND_SYN_RATE}" "${INBOUND_SYN_BURST}" "${PER_IP_CONN_CAP}" "${OUTBOUND_SYN_RATE}" "${OUTBOUND_SYN_BURST}"
       nft_apply
       nft_try_add_bittorrent_signature_rules
       ;;
     iptables)
-      iptables_apply "${SSH_PORT}" "${XRAY_PORTS}" "${PANEL_PORTS}" "${ALLOW_IN_TCP}" "${ALLOW_IN_UDP}" "${LOCKDOWN}"
+      iptables_apply "${EFFECTIVE_SSH_PORT}" "${EFFECTIVE_XRAY_PORTS}" "${EFFECTIVE_PANEL_PORTS}" "${EFFECTIVE_ALLOW_IN_TCP}" "${EFFECTIVE_ALLOW_IN_UDP}" "${LOCKDOWN}" "${INBOUND_SYN_RATE}" "${INBOUND_SYN_BURST}" "${PER_IP_CONN_CAP}" "${OUTBOUND_SYN_RATE}" "${OUTBOUND_SYN_BURST}"
       ;;
     *)
       die "Unknown backend in config: ${BACKEND}"
@@ -1300,13 +1686,16 @@ cmd_uninstall() {
   rm -f "${config_file}"
   rm -f "${nft_file}"
   rm -f "${sysctl_file}"
+  rm -f "${installed_listeners_manifest}"
+  rm -f "${default_listeners_example}"
   rm -f "${installed_bin}"
   rmdir "${config_dir}" 2>/dev/null || true
   if have_cmd sysctl; then
     sysctl --system >/dev/null 2>&1 || true
   fi
   if have_cmd netfilter-persistent; then
-    netfilter-persistent save >/dev/null 2>&1 || log "WARNING: netfilter-persistent save failed; check persistent rules manually."
+    log "WARNING: persistent firewall state was not overwritten."
+    log "WARNING: if you manually saved abuse-guard rules before, clean netfilter-persistent rules yourself."
   fi
 
   log "حذف شد."
@@ -1322,25 +1711,39 @@ cmd_status() {
     return 1
   fi
   read_config_or_die
+  refresh_runtime_ports
   echo "version=${ABUSE_GUARD_VERSION}"
   echo "backend=${BACKEND}"
   echo "lockdown=${LOCKDOWN}"
-  echo "ssh_port=${SSH_PORT}"
-  echo "xray_ports=${XRAY_PORTS}"
-  echo "panel_ports=${PANEL_PORTS}"
-  echo "allow_in_tcp=${ALLOW_IN_TCP}"
-  echo "allow_in_udp=${ALLOW_IN_UDP}"
+  echo "ssh_port=${EFFECTIVE_SSH_PORT}"
+  echo "ssh_port_source=${SSH_PORT_SOURCE}"
+  echo "listeners_file=${LISTENERS_FILE:-none}"
+  echo "manual_xray_ports=${MANUAL_XRAY_PORTS}"
+  echo "manual_panel_ports=${MANUAL_PANEL_PORTS}"
+  echo "manual_allow_in_tcp=${MANUAL_ALLOW_IN_TCP}"
+  echo "manual_allow_in_udp=${MANUAL_ALLOW_IN_UDP}"
+  echo "manifest_tcp_ports=${MANIFEST_TCP_PORTS:-none}"
+  echo "manifest_udp_ports=${MANIFEST_UDP_PORTS:-none}"
+  echo "effective_xray_ports=${EFFECTIVE_XRAY_PORTS}"
+  echo "effective_panel_ports=${EFFECTIVE_PANEL_PORTS}"
+  echo "effective_allow_in_tcp=${EFFECTIVE_ALLOW_IN_TCP}"
+  echo "effective_allow_in_udp=${EFFECTIVE_ALLOW_IN_UDP}"
   echo "auto_detect=${AUTO_DETECT}"
+  echo "auto_allow_panels=${AUTO_ALLOW_PANELS}"
   echo "allow_ss_fallback=${ALLOW_SS_FALLBACK}"
+  echo "allow_unsafe_lockdown_auto=${ALLOW_UNSAFE_LOCKDOWN_AUTO}"
   echo "refresh_interval=${REFRESH_INTERVAL}"
+  echo "inbound_syn_rate=${INBOUND_SYN_RATE}"
+  echo "inbound_syn_burst=${INBOUND_SYN_BURST}"
+  echo "per_ip_conn_cap=${PER_IP_CONN_CAP}"
+  echo "outbound_syn_rate=${OUTBOUND_SYN_RATE}"
+  echo "outbound_syn_burst=${OUTBOUND_SYN_BURST}"
+  echo "legacy_merged_port_config=${LEGACY_MERGED_PORT_CONFIG}"
+  echo "auto_detect_families=${AUTO_DETECT_FAMILIES:-none}"
+  echo "auto_active_service_ports=${AUTO_ACTIVE_SERVICE_PORTS}"
+  echo "auto_detect_used_generic_fallback=${AUTO_DETECT_USED_GENERIC_FALLBACK}"
+  echo "auto_single_service_family=${AUTO_SINGLE_SERVICE_FAMILY}"
 
-  if [[ "${AUTO_DETECT}" == "1" ]]; then
-    auto_detect_ports "${ALLOW_SS_FALLBACK}"
-  else
-    AUTO_TCP_PORTS=""
-    AUTO_UDP_PORTS=""
-    AUTO_PANEL_PORTS=""
-  fi
   echo "auto_detected_tcp=${AUTO_TCP_PORTS:-none}"
   echo "auto_detected_panel=${AUTO_PANEL_PORTS:-none}"
   echo "auto_detected_udp=${AUTO_UDP_PORTS:-none}"
