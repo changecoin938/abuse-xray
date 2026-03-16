@@ -1539,6 +1539,10 @@ cmd_install() {
     auto_detect="0"
   fi
 
+  # Make option-selected runtime mode visible to install-time trust checks
+  AUTO_ALLOW_PANELS="${auto_allow_panels}"
+  COMPAT_PUBLIC_NODE="${compat_public_node}"
+
   if [[ "${auto_detect}" == "1" ]]; then
     log "Auto-detecting tunnel/xray/panel ports..."
     auto_detect_ports "${allow_ss_fallback}"
