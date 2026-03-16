@@ -15,7 +15,7 @@ log() {
 
 need_root() {
   if [[ "${EUID:-$(id -u)}" != "0" ]]; then
-    die "این اسکریپت باید با root اجرا بشه (مثلا: sudo $0 ...)"
+    die "This script must be run as root (for example: sudo $0 ...)"
   fi
 }
 
@@ -115,13 +115,13 @@ validate_ports_or_die() {
   local p start end
   for p in ${list}; do
     if [[ "${p}" =~ ^[0-9]{1,5}$ ]]; then
-      ((p >= 1 && p <= 65535)) || die "پورت نامعتبر: ${p}"
+      ((p >= 1 && p <= 65535)) || die "Invalid port: ${p}"
     elif [[ "${p}" =~ ^([0-9]{1,5})[-:]([0-9]{1,5})$ ]]; then
       start="${BASH_REMATCH[1]}"
       end="${BASH_REMATCH[2]}"
-      ((start >= 1 && start <= 65535 && end >= 1 && end <= 65535 && start <= end)) || die "رنج پورت نامعتبر: ${p}"
+      ((start >= 1 && start <= 65535 && end >= 1 && end <= 65535 && start <= end)) || die "Invalid port range: ${p}"
     else
-      die "لیست پورت نامعتبر: ${p} (مثال درست: 443,8443 یا 10000-20000)"
+      die "Invalid port list entry: ${p} (valid examples: 443,8443 or 10000-20000)"
     fi
   done
 }
@@ -129,14 +129,14 @@ validate_ports_or_die() {
 validate_nonnegative_int_or_die() {
   local opt_name="$1"
   local value="${2:-}"
-  [[ "${value}" =~ ^[0-9]+$ ]] || die "${opt_name} باید عدد صحیح >= 0 باشد"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${opt_name} must be an integer >= 0"
 }
 
 validate_positive_int_or_die() {
   local opt_name="$1"
   local value="${2:-}"
-  [[ "${value}" =~ ^[0-9]+$ ]] || die "${opt_name} باید عدد صحیح > 0 باشد"
-  (( value > 0 )) || die "${opt_name} باید عدد صحیح > 0 باشد"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${opt_name} must be an integer > 0"
+  (( value > 0 )) || die "${opt_name} must be an integer > 0"
 }
 
 AUTO_TCP_PORTS=""
@@ -534,7 +534,7 @@ backend_auto() {
     echo "iptables"
     return
   fi
-  die "نه nft موجوده نه iptables"
+  die "Neither nft nor iptables is available"
 }
 
 config_dir="/etc/abuse-guard"
@@ -673,7 +673,7 @@ has_explicit_listener_config() {
 read_config() {
   local strict="${1:-1}"
   if [[ ! -r "${config_file}" ]]; then
-    [[ "${strict}" == "1" ]] && die "Config not found: ${config_file} (اول install را اجرا کنید)"
+    [[ "${strict}" == "1" ]] && die "Config not found: ${config_file} (run install first)"
     return 1
   fi
 
@@ -1522,7 +1522,7 @@ cmd_install() {
     ssh_port="$(detect_ssh_port)"
     ssh_port_source="auto"
   fi
-  [[ "${refresh_interval}" =~ ^[0-9]+$ ]] || die "--refresh-interval باید عدد صحیح >= 0 باشد"
+  [[ "${refresh_interval}" =~ ^[0-9]+$ ]] || die "--refresh-interval must be an integer >= 0"
   validate_nonnegative_int_or_die "--in-syn-rate" "${inbound_syn_rate}"
   validate_nonnegative_int_or_die "--in-syn-burst" "${inbound_syn_burst}"
   validate_nonnegative_int_or_die "--per-ip-conn-cap" "${per_ip_conn_cap}"
@@ -1578,9 +1578,9 @@ cmd_install() {
       fi
     else
       if [[ "${compat_public_node}" == "1" ]]; then
-        die "برای compat-public-node باید listener عمومیِ شناخته‌شده داشته باشی و generic ss fallback هم استفاده نشده باشد."
+        die "compat-public-node requires detected public listeners from supported services and no generic ss fallback usage."
       else
-        die "برای lockdown بدون پورت دستی/manifest باید دقیقاً یک family سرویس عمومیِ در حال listen داشته باشی تا auto-detect قابل اعتماد باشد. در غیر این صورت از --listeners-file یا پورت‌های دستی استفاده کن."
+        die "For lockdown without manual ports/manifest, exactly one public service family must be actively listening for auto-detect to be trusted. Otherwise use --listeners-file or manual ports."
       fi
     fi
   fi
@@ -1594,7 +1594,7 @@ cmd_install() {
   if [[ "${backend}" == "auto" ]]; then
     backend="$(backend_auto)"
   fi
-  [[ "${backend}" == "nft" || "${backend}" == "iptables" ]] || die "--backend باید nft یا iptables یا auto باشه"
+  [[ "${backend}" == "nft" || "${backend}" == "iptables" ]] || die "--backend must be nft, iptables, or auto"
 
   local firewall_conflict="0"
   if have_cmd ufw && ufw status >/dev/null 2>&1; then
@@ -1632,12 +1632,12 @@ cmd_install() {
   write_systemd_unit
   write_refresh_units "${refresh_interval}"
 
-  log "نصب شد. وضعیت:"
+  log "Installed. Status:"
   "${installed_bin}" status || true
   if [[ "${lockdown}" == "1" ]]; then
-    log "lockdown فعال است: فقط SSH + پورت‌های صریح/مجاز باز هستند."
+    log "Lockdown is active: only SSH and explicitly allowed ports are open."
   else
-    log "lockdown غیرفعال است: فقط بلاک‌های خروجی و hygiene ورودی اعمال شده."
+    log "Lockdown is disabled: only outbound abuse blocks and inbound hygiene rules are applied."
   fi
   if [[ -n "${listeners_file}" ]]; then
     log "listeners file installed at: ${listeners_file}"
@@ -1744,7 +1744,7 @@ cmd_uninstall() {
     log "WARNING: if you manually saved abuse-guard rules before, clean netfilter-persistent rules yourself."
   fi
 
-  log "حذف شد."
+  log "Uninstalled."
 }
 
 cmd_status() {
